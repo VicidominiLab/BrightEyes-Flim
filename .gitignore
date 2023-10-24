@@ -1,0 +1,11 @@
+build/
+dist/
+brighteyes_flim/__pycache__/
+brighteyes_flim/*/__pycache__/
+brighteyes_flim.egg-info/
+brighteyes_flim.egg-info/*
+venv
+.*
+*.pyc
+*.pyo
+.idea/
