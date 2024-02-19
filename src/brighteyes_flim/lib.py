@@ -521,7 +521,7 @@ def calculate_m_phi_tau_phi_tau_m(g0_or_complex, s0=None, dfd_freq=21e6):
     return phi, m, tau_phi, tau_m
 
 
-def calculate_phasor_on_img_ch(data_input, threshold=1, harmonic=1, merge_pixels=1, phasor_data_size=100):
+def calculate_phasor_on_img_ch(data_input, threshold=1, harmonic=1, phasor_data_size=100):
     '''
 
     :param data_input: data_input [r, z, y, x, t, ch]
@@ -532,22 +532,11 @@ def calculate_phasor_on_img_ch(data_input, threshold=1, harmonic=1, merge_pixels
     :return: out G=[r,z,y,x,y,ch,0] S=[r,z,y,x,y,ch,1]
     '''
 
-    #  if merge_pixels > 1:
-    #     data_input = sum_adjacent_pixel(data_input, merge_pixels)
-    #  else:
-    #     pass
-    # print(data_input)
-    # data_input_shape = data_input.shape
-    # if len(data_input_shape) != 4:  # changed from 6 to 4
-    #   raise ValueError("The shape data_input [r, z, y, x, t, ch]")
-
-    # print("data_input.shape", data_input.shape)
-    print('data input', data_input)
     x_dim, y_dim, bin_dim, channel_dim = data_input.shape[0], data_input.shape[1], data_input.shape[2], \
         data_input.shape[3]
     with h5py.File('dataset_of_phasor_per_channel', 'w') as fi:
 
-        # Create an empty dataset with the specified dimensions in dataset_shape
+        # Create an empty dataset with the specified dimensions in h5_dim
 
         h5_dim = (x_dim, y_dim, channel_dim)
         h5_dataset_p = fi.create_dataset('h5_dataset_p', shape=h5_dim, dtype=np.complex128)
@@ -563,14 +552,7 @@ def calculate_phasor_on_img_ch(data_input, threshold=1, harmonic=1, merge_pixels
 
                 aligned_phasor = np.zeros(sub_image_p.shape[:-2] + (sub_image_p.shape[-1],), dtype=np.complex128)
 
-                #   for i in range(sub_image.shape[0]):
-                #      for j in range(sub_image.shape[1]):
-                #         aligned_sub_image[i, j, :, :] = np.array([linear_shift(sub_image[i, j, :, ch],
-                #                                                               shift[ch], cyclic) for ch in
-                #                                                     range(0, image.shape[5])]).T
                 for cc in np.arange(sub_image_p.shape[-1]):
-                    # for rr in tqdm(np.arange(data_input.shape[-6]), leave=False):
-                    #   for zz in tqdm(np.arange(data_input.shape[-5]), leave=False):
                     for yy in np.arange(sub_image_p.shape[-4]):
                         for xx in np.arange(sub_image_p.shape[-3]):
                             aligned_phasor[yy, xx, cc] = calculate_phasor(sub_image_p[yy, xx, :, cc],
@@ -579,20 +561,6 @@ def calculate_phasor_on_img_ch(data_input, threshold=1, harmonic=1, merge_pixels
                 h5_dataset_p[x_start:x_stop, y_start:y_stop,
                 :] = aligned_phasor
     fi.close()
-    hf_phasor = h5py.File('dataset_of_phasor_per_channel', "r")
-    data_realigned = hf_phasor["h5_dataset_p"]
-    return data_realigned
-
-
-# out = np.zeros(data_input.shape[:-2] + (data_input.shape[-1],), dtype=complex)
-# print("out.shape", out.shape)
-
-# if len(data_input_shape) == 3:
-#   out = out[0, 0, :, :, :]
-# elif len(data_input_shape) == 4:
-#    out = out[0, :, :, :, :]
-
-# return out
 
 
 def calculate_phasor_on_img(data_input, threshold=1, harmonic=1):
@@ -604,24 +572,25 @@ def calculate_phasor_on_img(data_input, threshold=1, harmonic=1):
 
     :return: out G=[r,z,y,x,y,0] S=[r,z,y,x,y,1]
     '''
+
     data_input_shape = data_input.shape
     if len(data_input_shape) <= 3:
         raise ValueError("data_input must have 3 or more dimensions")
     elif len(data_input_shape) >= 6:
         raise ValueError("use calculate_phasor_on_img_ch() instead")
 
-  #  if len(data_input_shape) == 3:
-   #     data_input = data_input[None, None, :, :, :]
-   # elif len(data_input_shape) == 4:
-    #    data_input = data_input[None, :, :, :, :]
+    if len(data_input_shape) == 3:
+        data_input = data_input[None, None, :, :, :]
+    elif len(data_input_shape) == 4:
+        data_input = data_input[None, :, :, :, :]
 
     out = np.zeros(data_input.shape)
 
-   # for rr in tqdm(np.arange(data_input.shape[-5])):
-    #    for zz in tqdm(np.arange(data_input.shape[-4])):
-    for yy in tqdm(np.arange(data_input.shape[-3])):
-        for xx in np.arange(data_input.shape[-2]):
-            out[yy, xx] = calculate_phasor(data_input[yy, xx, :], threshold, harmonic)
+    for rr in tqdm(np.arange(data_input.shape[-5])):
+        for zz in tqdm(np.arange(data_input.shape[-4])):
+            for yy in tqdm(np.arange(data_input.shape[-3])):
+                for xx in np.arange(data_input.shape[-2]):
+                    out[rr, zz, yy, xx] = calculate_phasor(data_input[rr, zz, yy, xx, :], threshold, harmonic)
 
     if len(data_input_shape) == 3:
         out = out[0, 0, :, :, :]
@@ -629,6 +598,52 @@ def calculate_phasor_on_img(data_input, threshold=1, harmonic=1):
         out = out[0, :, :, :, :]
 
     return out
+
+
+def calculate_phasor_on_img_pixels(data_input, threshold=1, harmonic=1, phasor_pix_data_size=100):
+    '''
+
+    :param data_input: data_input [y, x, t] or [z, y, x, t] or [r, z, y, x, t]
+    :param threshold:
+    :param harmonic:
+
+    :return: out G=[r,z,y,x,y,0] S=[r,z,y,x,y,1]
+    '''
+    data_input_3d = np.sum(data_input, axis=3)
+    data_input_shape = data_input_3d.shape
+    if len(data_input_shape) < 3:
+        raise ValueError("data_input must have 3 or more dimensions")
+    elif len(data_input_shape) >= 6:
+        raise ValueError("use calculate_phasor_on_img_ch() instead")
+
+    with h5py.File('dataset_of_phasor_per_pixel', 'w') as fil:
+
+        # Create an empty dataset with the specified dimensions in dataset_shape
+        x_dim, y_dim = data_input_3d.shape[0], data_input_3d.shape[1]
+        h5_dim = (x_dim, y_dim)
+        h5_dataset_phasor_pix = fil.create_dataset('h5_dataset_phasor_pix', shape=h5_dim, dtype=np.complex128)
+        h5_dataset_phasor_pix[:] = np.zeros(h5_dim, dtype=np.complex128)
+
+        for x_start in range(0, x_dim, phasor_pix_data_size):
+            for y_start in range(0, y_dim, phasor_pix_data_size):
+                x_stop = min(x_start + phasor_pix_data_size, x_dim)
+                y_stop = min(y_start + phasor_pix_data_size, y_dim)
+
+                slice_term_pix = np.s_[x_start:x_stop, y_start:y_stop, :]
+                sub_image_pix = data_input_3d[slice_term_pix]
+
+                aligned_phasor_pix = np.zeros(sub_image_pix.shape[:-1], dtype=np.complex128)
+
+                # for cc in np.arange(sub_image_pix.shape[-1]):
+                # for rr in tqdm(np.arange(data_input.shape[-6]), leave=False):
+                #   for zz in tqdm(np.arange(data_input.shape[-5]), leave=False):
+                for yyy in np.arange(sub_image_pix.shape[-3]):
+                    for xxx in np.arange(sub_image_pix.shape[-2]):
+                        aligned_phasor_pix[yyy, xxx] = calculate_phasor(sub_image_pix[yyy, xxx, :],
+                                                                        threshold,
+                                                                        harmonic)
+                h5_dataset_phasor_pix[x_start:x_stop, y_start:y_stop] = aligned_phasor_pix
+    fil.close()
 
 
 def plot_tau(list_value=None, dfd_freq=21e6, ax=None):
