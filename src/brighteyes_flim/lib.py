@@ -196,7 +196,7 @@ class FlimData:
         phasors_shifted = self.phasor_global_corrected_irf()
         phasor_forced = 1.
         phasor_total = self.phasor_global_corrected(phasor_forced / phasors_shifted)
-        irf_term = -120 * np.angle(phasor_forced / phasors_shifted / phasor_total) / (2 * np.pi)
+        irf_term = np.angle(phasor_forced / phasors_shifted / phasor_total) / (2 * np.pi)
         return [irf_term, phasor_total, phasors_shifted]
 
     def save_aligned_histogram_per_pixel(self, data_path: str, sub_image_size: int, cyclic=True):
