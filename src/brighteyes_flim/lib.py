@@ -1,6 +1,7 @@
 import numpy as np
 from matplotlib import colors
 from matplotlib.pyplot import gca
+from matplotlib.colors import hsv_to_rgb
 
 from tqdm.auto import tqdm
 
@@ -8,13 +9,14 @@ import h5py
 import matplotlib.pyplot as plt
 
 import brighteyes_ism.dataio.mcs as mcs
+from skimage.filters import threshold_otsu as otsu
 
 
 class FlimData:
 
-    def __init__(self, data_path: str = None, data_path_irf: str = None, freq_exc: float = 21e6,
-                 correction_coeff: complex = None,
-                 step_size: int = None, pre_filter: str = None):
+    def __init__(self, data_path: str = None, data_path_irf: str = None, data_path_ttm: str = None,
+                 freq_exc: float = 21e6, correction_coeff: complex = None,
+                 step_size: int = None, pre_filter: str = None, ignore_laser: bool = False):
         '''
 
         :param data_path:
@@ -24,11 +26,11 @@ class FlimData:
         '''
 
         #
-        print("CIAO")
+
         self.phasor_laser = 0.0j
         self.phasor_laser_irf = 0.0j
         self.freq_exc = freq_exc
-
+        self.ignore_laser = ignore_laser
         # The source data
         self.data = None
 
@@ -74,7 +76,7 @@ class FlimData:
 
         self.step_size = step_size
 
-        if data_path is not None:
+        if data_path is not None and not ignore_laser:
             self.load_data_irf(data_path_irf, sub_image_size=100)
             self.load_data(data_path, sub_image_size=100)
             self.calculate_phasor_global_irf()
@@ -82,6 +84,10 @@ class FlimData:
             self.calculate_phasor_laser()
             self.calculate_phasor_laser_irf()
             self.save_aligned_histogram_per_pixel(data_path, sub_image_size=100)
+
+        else:
+            print("CIAO TTM")
+            self.save_histogram_decay_ttm(data_path_ttm, sub_image_dim=256)
 
         #  self.hf = h5py.File('dataset_of_pixel_histogram_aligned', "r")
         # self.image_with_histogram_realigned_in_each_pixel = self.hf["h5_dataset"]
@@ -125,15 +131,6 @@ class FlimData:
         data_extra, _ = mcs.load(data_path, key="data_channels_extra")
         data_laser = data_extra[:, :, :, :, :, 1]
         image = self.data["data"]
-        # Sum across all (x, y) pixels
-        # if self.slicing == 0:
-        # self.sliced_data = image
-        # self.data_laser_hist_non_sliced = data_laser
-        # self.data_hist = np.sum(self.sliced_data, axis=(0, 1, 2, 3))
-        # self.data_laser_hist = np.sum(self.data_laser_hist_non_sliced, axis=(0, 1, 2, 3))
-
-        # else:
-        # Iterate over sub-images
 
         x_size, y_size = image.shape[2], image.shape[3]
 
@@ -153,26 +150,30 @@ class FlimData:
                 self.data_laser_hist += sub_data_hist_laser
                 self.data_hist += np.array([sub_data_hist[:, i] for i in range(0, image.shape[5])]).T
 
-    # def calculate_shift(self):
-    #   phasors_shifted = self.phasor_global_corrected()
-    #  phi_shifted = np.angle(phasors_shifted)
-    # self.shift_term = -120 * phi_shifted / (2 * np.pi)
-    # return self.shift_term
+    # else:
+    #   self.data, self.metadata = mcs.load(data_path)
+
+    #  x_size, y_size = self.data.shape[0], self.data.shape[1]
+
+    # for x_start in range(0, x_size, sub_image_size):
+    #    for y_start in range(0, y_size, sub_image_size):
+    #       x_stop = min(x_start + sub_image_size, x_size)
+    #      y_stop = min(y_start + sub_image_size, y_size)
+
+    #     slice_term = np.s_[:, :, x_start:x_stop:self.step_size, y_start:y_stop:self.step_size, :, :]
+    #    sub_image = self.data[slice_term]
+
+    # Calculate data_hist for the current sub-image
+    #   sub_data_hist = np.sum(sub_image, axis=(0, 1))
+
+    #  self.data_hist_ttm += np.array([sub_data_hist[:, i] for i in range(0, self.data.shape[3])]).T
+
     def load_data_irf(self, data_path_irf: str, sub_image_size: int = 100):
         self.data_irf = h5py.File(data_path_irf)
         self.metadata_irf = mcs.metadata_load(data_path_irf)  # data_format = 'h5'
         data_extra_irf, _ = mcs.load(data_path_irf, key="data_channels_extra")
         data_laser_irf = data_extra_irf[:, :, :, :, :, 1]
         image_irf = self.data_irf["data"]
-        # Sum across all (x, y) pixels
-        # if self.slicing == 0:
-        # self.sliced_data = image
-        # self.data_laser_hist_non_sliced = data_laser
-        # self.data_hist = np.sum(self.sliced_data, axis=(0, 1, 2, 3))
-        # self.data_laser_hist = np.sum(self.data_laser_hist_non_sliced, axis=(0, 1, 2, 3))
-
-        # else:
-        # Iterate over sub-images
 
         x_size_irf, y_size_irf = image_irf.shape[2], image_irf.shape[3]
 
@@ -191,6 +192,24 @@ class FlimData:
                 sub_data_hist_laser_irf = np.sum(sub_image_laser_irf, axis=(0, 1, 2, 3))
                 self.data_laser_hist_irf += sub_data_hist_laser_irf
                 self.data_hist_irf += np.array([sub_data_hist_irf[:, i] for i in range(0, image_irf.shape[5])]).T
+
+    # else:
+    #    self.data_irf, self.metadata_irf = mcs.load(data_path_irf)
+
+    #   x_size, y_size = self.data_irf.shape[0], self.data_irf.shape[1]
+
+    #  for x_start in range(0, x_size, sub_image_size):
+    #     for y_start in range(0, y_size, sub_image_size):
+    #        x_stop = min(x_start + sub_image_size, x_size)
+    #       y_stop = min(y_start + sub_image_size, y_size)
+
+    #      slice_term_irf = np.s_[:, :, x_start:x_stop:self.step_size, y_start:y_stop:self.step_size, :, :]
+    #     sub_image_irf = self.data_irf[slice_term_irf]
+
+    # Calculate data_hist for the current sub-image
+    #    sub_data_hist_irf = np.sum(sub_image_irf, axis=(0, 1))
+
+    #   self.data_hist_irf_ttm += np.array([sub_data_hist_irf[:, i] for i in range(0, self.data_irf.shape[3])]).T
 
     def calculate_irf_correction(self):
         phasors_shifted = self.phasor_global_corrected_irf()
@@ -249,6 +268,30 @@ class FlimData:
     #  def calculate_phasor_on_img_ch(self, merge_adjacent_pixel=1):
     #     self.phasors = calculate_phasor_on_img_ch(self.data, merge_pixels=merge_adjacent_pixel)
     #    return self.phasors
+
+    def save_histogram_decay_ttm(self, data_path_ttm: str, sub_image_dim: int):
+        self.data = h5py.File(data_path_ttm)
+        image = self.data["dataset_1"]
+        x_size, y_size, bin_size, channel_size = image.shape[0], image.shape[1], image.shape[2], \
+            image.shape[3]
+
+        with h5py.File('dataset_of_pixel_histogram_aligned_ttm', 'w') as f:
+
+            # Create an empty dataset with the specified dimensions in dataset_shape
+            dataset_shape = (x_size, y_size, bin_size, channel_size)
+            h5_dataset_ttm = f.create_dataset('h5_dataset_ttm', shape=dataset_shape, dtype=np.float32)
+            h5_dataset_ttm[:] = np.zeros(dataset_shape, dtype=np.float32)
+
+            for x_start in range(0, x_size, sub_image_dim):
+                for y_start in range(0, y_size, sub_image_dim):
+                    x_stop = min(x_start + sub_image_dim, x_size)
+                    y_stop = min(y_start + sub_image_dim, y_size)
+
+                    slice_term = np.s_[x_start:x_stop, y_start:y_stop, :, :]
+                    sub_image = image[slice_term]
+                    h5_dataset_ttm[x_start:x_stop, y_start:y_stop, :, :] = sub_image
+
+        f.close()
 
     def calculate_phasor_global(self):
         self.phasors_global = calculate_phasor(self.data_hist)
@@ -460,19 +503,21 @@ def calculate_phasor(data_hist, threshold=1, harmonic=1):
 
     data = data_hist
     if len(data.shape) == 1:
-        N = np.sum(data)
+        data_thresholded = np.where(data < 10, data, 0)
+        N = np.sum(data_thresholded)
         if N < threshold:
             return np.nan + 1j * np.nan
         else:
-            f = np.fft.fft(data / N)  # FFT of normalized data
+            f = np.fft.fft(data_thresholded / N)  # FFT of normalized data
             return f[harmonic].conj()  # 1st harmonic
     elif len(data.shape) == 2:
-        N = np.sum(data, axis=0)
-        print(N.shape, data.shape)
-        f = np.fft.fft(data / N, axis=0)  # FFT of normalized data
+        data_thresholded = np.where(data < 10, data, 0)
+        N = np.sum(data_thresholded, axis=0)
+        print(N.shape, data_thresholded.shape)
+        f = np.fft.fft(data_thresholded / N, axis=0)  # FFT of normalized data
         print(f.shape)
         out = f[harmonic]
-        out[N < threshold * np.ones(data.shape[1])] = np.nan + 1j * np.nan
+        out[N < threshold * np.ones(data_thresholded.shape[1])] = np.nan + 1j * np.nan
         return out.conj()
     else:
         raise ValueError("Wrong input dimension")
@@ -616,7 +661,7 @@ def calculate_phasor_on_img_pixels(data_input, threshold=1, harmonic=1, phasor_p
     elif len(data_input_shape) >= 6:
         raise ValueError("use calculate_phasor_on_img_ch() instead")
 
-    with h5py.File('dataset_of_phasor_per_pixel', 'w') as fil:
+    with h5py.File('dataset_of_phasor_per_pixel_ttm', 'w') as fil:
 
         # Create an empty dataset with the specified dimensions in dataset_shape
         x_dim, y_dim = data_input_3d.shape[0], data_input_3d.shape[1]
@@ -744,6 +789,142 @@ def fourier_shift(data, shift_angle=0.):
         w = np.asarray([np.arange(data.shape[0])] * data.shape[1]).T
         fft_hists = np.fft.fft(data)
     return np.abs(np.fft.ifft(fft_hists * np.exp(1j * 2 * np.pi * shift_angle * w)))
+
+
+def cmap2d(intensity, lifetime, params):
+    sz = intensity.shape
+
+    Hp = np.minimum(np.maximum(lifetime, params["minTau"]), params["maxTau"])
+
+    # the HSV representation
+    Hn = ((Hp - params["minTau"]) / (params["maxTau"] - params["minTau"])) * params[
+        "satFactor"
+    ]
+    Sn = np.ones(Hp.shape)
+    Vn = (intensity - params["minInt"]) / (params["maxInt"] - params["minInt"])
+
+    HSV = np.empty((sz[0], sz[1], 3))
+
+    if params["invertColormap"] == True:
+        Hn = params["satFactor"] - Hn
+
+    # set to violet color of pixels outside lifetime bounds
+    # BG = intensity < ( np.max(intensity * params.bgIntPerc )
+    Hn[np.not_equal(lifetime, Hp)] = params["outOfBoundsHue"]
+
+    HSV[:, :, 0] = Hn.astype("float64")
+    HSV[:, :, 1] = Sn.astype("float64")
+    HSV[:, :, 2] = Vn.astype("float64")
+
+    # convert to RGB
+    RGB = hsv_to_rgb(HSV)
+
+    return RGB
+
+
+def showFLIM(
+        intensity,
+        lifetime,
+        bounds_tau=None,
+        bounds_int=None,
+        satFactor=0.657,
+        outOfBoundsHue=0.8,
+        invertColormap=False,
+        fig=None,
+):
+    """
+    Display together the lifetime and intensity images with a proper colormap.
+    Referring to the HSV color model:
+    Intensity values are mapped in Value
+    Lifetime values are mapped in Hue
+    If the lifetime of a pixel is outside the interval [minInt, maxInt],
+    that pixel is rendered with Hue outOfBoundsHue (default: violet)
+
+    Input parameters
+    intensityIm:        Pixel values are photon counts.
+    lifetimeIm:         Pixel values are lifetime values.
+
+    bounds_Tau
+        minTau:             minimum lifetime value of the colorbar
+        maxTau:             maximum lifetime value of the colorbar
+    bounds_Int
+        minInt:             minimum intensity value of the colorbar
+        maxInt:             maximum intensity value of the colorbar
+    invertColormap:     (False)
+    outOfBoundsHue:      Hue to render the out of bounds pixels (0.8)
+    satFactor:           The span of the Hue space (0.657)
+
+    Last Modified May 2022 by Alessandro Zunino
+    Based on the MATLAB function written by Giorgio Tortarolo
+    """
+    histograms_filtered = otsu(image=intensity, nbins=50)
+    hist_indexes = np.argwhere(intensity > histograms_filtered)
+
+    if bounds_tau is None:
+        tau_denoised = lifetime[hist_indexes[:, 0], hist_indexes[:, 1]]
+        bounds_tau = {
+            "minTau": np.min(tau_denoised),
+            "maxTau": np.max(tau_denoised),
+        }
+
+    if bounds_int is None:
+        histogram_denoised = intensity[hist_indexes[:, 0], hist_indexes[:, 1]]
+        bounds_int = {"minInt": np.min(histogram_denoised), "maxInt": np.max(histogram_denoised )}
+
+    params = bounds_tau.copy()
+    params.update(bounds_int)
+
+    params["invertColormap"] = invertColormap
+    params["satFactor"] = satFactor
+    params["outOfBoundsHue"] = outOfBoundsHue
+
+    sz = intensity.shape
+    N = sz[0]
+
+    # Image
+
+    RGB = cmap2d(intensity, lifetime, params)
+
+    # Colorbar
+
+    LG = np.linspace(params["minTau"], params["maxTau"], num=sz[0])
+    LifeTimeGradient = np.tile(LG, (N, 1))
+
+    IG = np.linspace(params["minInt"], params["maxInt"], num=N)
+    IntensityGradient = np.transpose(np.tile(IG, (sz[0], 1)))
+
+    RGB_colormap = cmap2d(IntensityGradient, LifeTimeGradient, params)
+    RGB_colormap = np.moveaxis(RGB_colormap, 0, 1)
+
+    # Show combined image with colorbar
+
+    extent = (params["minInt"], params["maxInt"], params["minTau"], params["maxTau"])
+
+    if fig is None:
+        fig = plt.figure(figsize=(9, 8))
+
+    widths = [0.05, 1]
+    heights = [1]
+    spec = fig.add_gridspec(
+        ncols=2, nrows=1, width_ratios=widths, height_ratios=heights
+    )
+
+    ax = fig.add_subplot(spec[0, 1])
+
+    ax.imshow(RGB)
+    ax.axis("off")
+
+    ax = fig.add_subplot(spec[0, 0])
+
+    ax.imshow(RGB_colormap, origin="lower", aspect="auto", extent=extent)
+    ax.set_xticks([params["minInt"], params["maxInt"]])
+    ax.set_xlabel("Counts")
+    ax.set_ylabel("Lifetime")
+
+    if fig is None:
+        plt.tight_layout()
+
+    return RGB, RGB_colormap
 
 
 def linear_shift(data, shift, cyclic=True):
