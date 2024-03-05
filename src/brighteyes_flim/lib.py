@@ -2,6 +2,7 @@ import numpy as np
 from matplotlib import colors
 from matplotlib.pyplot import gca
 from matplotlib.colors import hsv_to_rgb
+from matplotlib_scalebar.scalebar import ScaleBar
 
 from tqdm.auto import tqdm
 
@@ -919,7 +920,7 @@ def showFLIM(
     ax.imshow(RGB_colormap, origin="lower", aspect="auto", extent=extent)
     ax.set_xticks([params["minInt"], params["maxInt"]])
     ax.set_xlabel("Counts")
-    ax.set_ylabel("Lifetime")
+    ax.set_ylabel("Lifetime (ns)")
 
     if fig is None:
         plt.tight_layout()
