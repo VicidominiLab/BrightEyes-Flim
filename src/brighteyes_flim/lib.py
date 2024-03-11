@@ -16,8 +16,8 @@ from skimage.filters import threshold_otsu as otsu
 class FlimData:
 
     def __init__(self, data_path: str = None, data_path_irf: str = None, data_path_ttm: str = None,
-                 freq_exc: float = 21e6, correction_coeff: complex = None,
-                 step_size: int = None, pre_filter: str = None, ignore_laser: bool = False):
+                 freq_exc: float = 21e6, correction_coeff: complex = None, step_size: int = None,
+                 sub_image_size: int = 100, pre_filter: str = None, ignore_laser: bool = False):
         '''
 
         :param data_path:
@@ -32,6 +32,7 @@ class FlimData:
         self.phasor_laser_irf = 0.0j
         self.freq_exc = freq_exc
         self.ignore_laser = ignore_laser
+        self.sub_image_size = sub_image_size
         # The source data
         self.data = None
 
@@ -40,14 +41,30 @@ class FlimData:
         # sliced data along xy dimensions
         self.sliced_data = None
 
-        # The global histogram (for each ch.)
-        self.data_hist = np.zeros((120, 25))
+        self.bin_number = 120
 
-        self.data_hist_irf = np.zeros((120, 25))
+        # The global histogram (for each ch.)
+        if data_path is not None:
+            with h5py.File(data_path, "r") as hf:
+                if "data" in hf.keys():
+                    img = hf["data"]
+                    self.bin_number = img.shape[4]
+                    self.channel_number = img.shape[5]
+
+        if data_path_ttm is not None:
+            with h5py.File(data_path_ttm, "r") as h:
+                if "dataset_1" in h.keys():
+                    img = h["dataset_1"]
+                    self.bin_number = img.shape[2]
+                    self.channel_number = img.shape[3]
+
+        self.data_hist = np.zeros((self.bin_number, self.channel_number))
+
+        self.data_hist_irf = np.zeros((self.bin_number, self.channel_number))
 
         # The laser data histogram (26th channel)
-        self.data_laser_hist = np.zeros(120)
-        self.data_laser_hist_irf = np.zeros(120)
+        self.data_laser_hist = np.zeros(self.bin_number)
+        self.data_laser_hist_irf = np.zeros(self.bin_number)
 
         # initialize dataset to store histograms aligned for each pixel
 
@@ -78,21 +95,17 @@ class FlimData:
         self.step_size = step_size
 
         if data_path is not None and not ignore_laser:
-            self.load_data_irf(data_path_irf, sub_image_size=100)
-            self.load_data(data_path, sub_image_size=100)
+            self.load_data_irf(data_path_irf, sub_image_size=self.sub_image_size)
+            self.load_data(data_path, sub_image_size=self.sub_image_size)
             self.calculate_phasor_global_irf()
             self.calculate_phasor_global()
             self.calculate_phasor_laser()
             self.calculate_phasor_laser_irf()
-            self.save_aligned_histogram_per_pixel(data_path, sub_image_size=100)
+            self.save_aligned_histogram_per_pixel(data_path, sub_image_size=self.sub_image_size)
 
         else:
-            print("CIAO TTM")
-            self.save_histogram_decay_ttm(data_path_ttm, sub_image_dim=256)
-
-        #  self.hf = h5py.File('dataset_of_pixel_histogram_aligned', "r")
-        # self.image_with_histogram_realigned_in_each_pixel = self.hf["h5_dataset"]
-        # self.calculate_phasor_on_img_pixel(self.image_with_histogram_realigned_in_each_pixel)
+            print("TTM data loading")
+            self.save_histogram_decay_ttm(data_path_ttm, sub_image_dim=self.sub_image_size)
 
         if pre_filter is not None:
 
@@ -126,7 +139,7 @@ class FlimData:
         # print("Global", self.phasors_global)
         # print("Laser", self.phasor_laser)
 
-    def load_data(self, data_path: str, sub_image_size: int = 100):
+    def load_data(self, data_path: str, sub_image_size: int):
         self.data = h5py.File(data_path)
         self.metadata = mcs.metadata_load(data_path)  # data_format = 'h5'
         data_extra, _ = mcs.load(data_path, key="data_channels_extra")
@@ -169,7 +182,7 @@ class FlimData:
 
     #  self.data_hist_ttm += np.array([sub_data_hist[:, i] for i in range(0, self.data.shape[3])]).T
 
-    def load_data_irf(self, data_path_irf: str, sub_image_size: int = 100):
+    def load_data_irf(self, data_path_irf: str, sub_image_size: int):
         self.data_irf = h5py.File(data_path_irf)
         self.metadata_irf = mcs.metadata_load(data_path_irf)  # data_format = 'h5'
         data_extra_irf, _ = mcs.load(data_path_irf, key="data_channels_extra")
@@ -220,6 +233,7 @@ class FlimData:
         return [irf_term, phasor_total, phasors_shifted]
 
     def save_aligned_histogram_per_pixel(self, data_path: str, sub_image_size: int, cyclic=True):
+        print("start data saving")
         [shift, phasor_on_channels, phasors_irf] = self.calculate_irf_correction()
         self.data = h5py.File(data_path)
         self.metadata = mcs.metadata_load(data_path)  # data_format = 'h5'
@@ -870,7 +884,7 @@ def showFLIM(
 
     if bounds_int is None:
         histogram_denoised = intensity[hist_indexes[:, 0], hist_indexes[:, 1]]
-        bounds_int = {"minInt": np.min(histogram_denoised), "maxInt": np.max(histogram_denoised )}
+        bounds_int = {"minInt": np.min(histogram_denoised), "maxInt": np.max(histogram_denoised)}
 
     params = bounds_tau.copy()
     params.update(bounds_int)
