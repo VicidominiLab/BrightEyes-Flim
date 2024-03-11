@@ -17,7 +17,7 @@ class FlimData:
 
     def __init__(self, data_path: str = None, data_path_irf: str = None, data_path_ttm: str = None,
                  freq_exc: float = 21e6, correction_coeff: complex = None, step_size: int = None,
-                 sub_image_size: int = 100, pre_filter: str = None, ignore_laser: bool = False):
+                 sub_image_dim: int = 100, pre_filter: str = None, ignore_laser: bool = False):
         '''
 
         :param data_path:
@@ -32,7 +32,7 @@ class FlimData:
         self.phasor_laser_irf = 0.0j
         self.freq_exc = freq_exc
         self.ignore_laser = ignore_laser
-        self.sub_image_size = sub_image_size
+        self.sub_image_dim = sub_image_dim
         # The source data
         self.data = None
 
@@ -95,17 +95,17 @@ class FlimData:
         self.step_size = step_size
 
         if data_path is not None and not ignore_laser:
-            self.load_data_irf(data_path_irf, sub_image_size=self.sub_image_size)
-            self.load_data(data_path, sub_image_size=self.sub_image_size)
+            self.load_data_irf(data_path_irf, sub_image_size=self.sub_image_dim)
+            self.load_data(data_path, sub_image_size=self.sub_image_dim)
             self.calculate_phasor_global_irf()
             self.calculate_phasor_global()
             self.calculate_phasor_laser()
             self.calculate_phasor_laser_irf()
-            self.save_aligned_histogram_per_pixel(data_path, sub_image_size=self.sub_image_size)
+            self.save_aligned_histogram_per_pixel(data_path, sub_image_size=self.sub_image_dim)
 
         else:
             print("TTM data loading")
-            self.save_histogram_decay_ttm(data_path_ttm, sub_image_dim=self.sub_image_size)
+            self.save_histogram_decay_ttm(data_path_ttm, sub_image_dim=self.sub_image_dim)
 
         if pre_filter is not None:
 
