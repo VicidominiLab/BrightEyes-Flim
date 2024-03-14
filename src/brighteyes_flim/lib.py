@@ -8,6 +8,7 @@ from tqdm.auto import tqdm
 
 import h5py
 import matplotlib.pyplot as plt
+import os
 
 import brighteyes_ism.dataio.mcs as mcs
 from skimage.filters import threshold_otsu as otsu
@@ -15,9 +16,9 @@ from skimage.filters import threshold_otsu as otsu
 
 class FlimData:
 
-    def __init__(self, data_path: str = None, data_path_irf: str = None, data_path_ttm: str = None,
+    def __init__(self, data_path: str = None, data_path_irf: str = None,
                  freq_exc: float = 21e6, correction_coeff: complex = None, step_size: int = None,
-                 sub_image_dim: int = 100, pre_filter: str = None, ignore_laser: bool = False):
+                 sub_image_dim: int = 100, pre_filter: str = None):
         '''
 
         :param data_path:
@@ -31,7 +32,7 @@ class FlimData:
         self.phasor_laser = 0.0j
         self.phasor_laser_irf = 0.0j
         self.freq_exc = freq_exc
-        self.ignore_laser = ignore_laser
+
         self.sub_image_dim = sub_image_dim
         # The source data
         self.data = None
@@ -50,13 +51,6 @@ class FlimData:
                     img = hf["data"]
                     self.bin_number = img.shape[4]
                     self.channel_number = img.shape[5]
-
-        if data_path_ttm is not None:
-            with h5py.File(data_path_ttm, "r") as h:
-                if "dataset_1" in h.keys():
-                    img = h["dataset_1"]
-                    self.bin_number = img.shape[2]
-                    self.channel_number = img.shape[3]
 
         self.data_hist = np.zeros((self.bin_number, self.channel_number))
 
@@ -94,7 +88,7 @@ class FlimData:
 
         self.step_size = step_size
 
-        if data_path is not None and not ignore_laser:
+        if data_path is not None:
             self.load_data_irf(data_path_irf, sub_image_size=self.sub_image_dim)
             self.load_data(data_path, sub_image_size=self.sub_image_dim)
             self.calculate_phasor_global_irf()
@@ -102,10 +96,6 @@ class FlimData:
             self.calculate_phasor_laser()
             self.calculate_phasor_laser_irf()
             self.save_aligned_histogram_per_pixel(data_path, sub_image_size=self.sub_image_dim)
-
-        else:
-            print("TTM data loading")
-            self.save_histogram_decay_ttm(data_path_ttm, sub_image_dim=self.sub_image_dim)
 
         if pre_filter is not None:
 
@@ -164,24 +154,6 @@ class FlimData:
                 self.data_laser_hist += sub_data_hist_laser
                 self.data_hist += np.array([sub_data_hist[:, i] for i in range(0, image.shape[5])]).T
 
-    # else:
-    #   self.data, self.metadata = mcs.load(data_path)
-
-    #  x_size, y_size = self.data.shape[0], self.data.shape[1]
-
-    # for x_start in range(0, x_size, sub_image_size):
-    #    for y_start in range(0, y_size, sub_image_size):
-    #       x_stop = min(x_start + sub_image_size, x_size)
-    #      y_stop = min(y_start + sub_image_size, y_size)
-
-    #     slice_term = np.s_[:, :, x_start:x_stop:self.step_size, y_start:y_stop:self.step_size, :, :]
-    #    sub_image = self.data[slice_term]
-
-    # Calculate data_hist for the current sub-image
-    #   sub_data_hist = np.sum(sub_image, axis=(0, 1))
-
-    #  self.data_hist_ttm += np.array([sub_data_hist[:, i] for i in range(0, self.data.shape[3])]).T
-
     def load_data_irf(self, data_path_irf: str, sub_image_size: int):
         self.data_irf = h5py.File(data_path_irf)
         self.metadata_irf = mcs.metadata_load(data_path_irf)  # data_format = 'h5'
@@ -207,24 +179,6 @@ class FlimData:
                 self.data_laser_hist_irf += sub_data_hist_laser_irf
                 self.data_hist_irf += np.array([sub_data_hist_irf[:, i] for i in range(0, image_irf.shape[5])]).T
 
-    # else:
-    #    self.data_irf, self.metadata_irf = mcs.load(data_path_irf)
-
-    #   x_size, y_size = self.data_irf.shape[0], self.data_irf.shape[1]
-
-    #  for x_start in range(0, x_size, sub_image_size):
-    #     for y_start in range(0, y_size, sub_image_size):
-    #        x_stop = min(x_start + sub_image_size, x_size)
-    #       y_stop = min(y_start + sub_image_size, y_size)
-
-    #      slice_term_irf = np.s_[:, :, x_start:x_stop:self.step_size, y_start:y_stop:self.step_size, :, :]
-    #     sub_image_irf = self.data_irf[slice_term_irf]
-
-    # Calculate data_hist for the current sub-image
-    #    sub_data_hist_irf = np.sum(sub_image_irf, axis=(0, 1))
-
-    #   self.data_hist_irf_ttm += np.array([sub_data_hist_irf[:, i] for i in range(0, self.data_irf.shape[3])]).T
-
     def calculate_irf_correction(self):
         phasors_shifted = self.phasor_global_corrected_irf()
         phasor_forced = 1.
@@ -240,7 +194,17 @@ class FlimData:
         image = self.data["data"]
         x_size, y_size, bin_size, channel_size = image.shape[2], image.shape[3], image.shape[4], image.shape[5]
 
-        with h5py.File('dataset_of_pixel_histogram_aligned', 'w') as f:
+        # Extract directory and filename from the provided data_path
+        directory, filename = os.path.split(data_path)
+        # Remove file extension
+        filename = os.path.splitext(filename)[0]
+
+        # Generate new filename with "aligned" appended
+        new_filename = filename + "_aligned.h5"
+        # Construct full path for the new file
+        new_file_path = os.path.join(directory, new_filename)
+
+        with h5py.File(new_file_path, 'w') as f:
 
             # Create an empty dataset with the specified dimensions in dataset_shape
             dataset_shape = (x_size, y_size, bin_size, channel_size)
@@ -266,46 +230,6 @@ class FlimData:
 
                     h5_dataset[x_start:x_stop:self.step_size, y_start:y_stop:self.step_size, :,
                     :] = aligned_sub_image
-        f.close()
-        # hf = h5py.File('dataset_of_pixel_histogram_aligned', "r")
-        # image_realigned = hf["h5_dataset"]  # image with histograms realigned in each pixel
-        # self.phasors = calculate_phasor_on_img_ch(image_realigned)
-        # phasor_processed = self.phasors_corrected(1 / phasors_irf)
-        # plot_phasor(phasor_processed, bins_2dplot=200, log_scale=False)
-        # for i in range(0, 25):
-        #   plt.plot(np.nanmean(np.real(phasor_on_channels[i])), np.nanmean(np.imag(phasor_on_channels[i])), ".r")
-        #   m, phi, tau, tau_m = calculate_m_phi_tau_phi_tau_m(phasor_on_channels[i], dfd_freq=21e6)
-        #  print("%d\tphi: %.2e\tm: %.2e\t\ttau_phi: %.2e \ttau_m: %.2e" % (i, phi, m, tau, tau_m))
-
-        # plt.xlim(-1., 1.)
-        # plt.ylim(-1., 1.)
-
-    #  def calculate_phasor_on_img_ch(self, merge_adjacent_pixel=1):
-    #     self.phasors = calculate_phasor_on_img_ch(self.data, merge_pixels=merge_adjacent_pixel)
-    #    return self.phasors
-
-    def save_histogram_decay_ttm(self, data_path_ttm: str, sub_image_dim: int):
-        self.data = h5py.File(data_path_ttm)
-        image = self.data["dataset_1"]
-        x_size, y_size, bin_size, channel_size = image.shape[0], image.shape[1], image.shape[2], \
-            image.shape[3]
-
-        with h5py.File('dataset_of_pixel_histogram_aligned_ttm', 'w') as f:
-
-            # Create an empty dataset with the specified dimensions in dataset_shape
-            dataset_shape = (x_size, y_size, bin_size, channel_size)
-            h5_dataset_ttm = f.create_dataset('h5_dataset_ttm', shape=dataset_shape, dtype=np.float32)
-            h5_dataset_ttm[:] = np.zeros(dataset_shape, dtype=np.float32)
-
-            for x_start in range(0, x_size, sub_image_dim):
-                for y_start in range(0, y_size, sub_image_dim):
-                    x_stop = min(x_start + sub_image_dim, x_size)
-                    y_stop = min(y_start + sub_image_dim, y_size)
-
-                    slice_term = np.s_[x_start:x_stop, y_start:y_stop, :, :]
-                    sub_image = image[slice_term]
-                    h5_dataset_ttm[x_start:x_stop, y_start:y_stop, :, :] = sub_image
-
         f.close()
 
     def calculate_phasor_global(self):
@@ -660,23 +584,34 @@ def calculate_phasor_on_img(data_input, threshold=1, harmonic=1):
     return out
 
 
-def calculate_phasor_on_img_pixels(data_input, threshold=1, harmonic=1, phasor_pix_data_size=100):
+def calculate_phasor_on_img_pixels(data_path, data_input, threshold=1, harmonic=1, phasor_pix_data_size=100):
     '''
 
+    :param data_path: path of the analyzed sample
     :param data_input: data_input [y, x, t] or [z, y, x, t] or [r, z, y, x, t]
     :param threshold:
     :param harmonic:
-
+    :param phasor_pix_data_size: slice of pixels on which the phasors are computed
     :return: out G=[r,z,y,x,y,0] S=[r,z,y,x,y,1]
     '''
     data_input_3d = np.sum(data_input, axis=3)
     data_input_shape = data_input_3d.shape
+
+    # Extract directory and filename from the provided data_path
+    directory, filename = os.path.split(data_path)
+    # Remove file extension
+    filename = os.path.splitext(filename)[0]
+
+    # Generate new filename with "aligned" appended
+    new_filename = filename + "_phasors_matrix.h5"
+    # Construct full path for the new file
+    new_file_path = os.path.join(directory, new_filename)
     if len(data_input_shape) < 3:
         raise ValueError("data_input must have 3 or more dimensions")
     elif len(data_input_shape) >= 6:
         raise ValueError("use calculate_phasor_on_img_ch() instead")
 
-    with h5py.File('dataset_of_phasor_per_pixel_ttm', 'w') as fil:
+    with h5py.File(new_file_path, 'w') as fil:
 
         # Create an empty dataset with the specified dimensions in dataset_shape
         x_dim, y_dim = data_input_3d.shape[0], data_input_3d.shape[1]
