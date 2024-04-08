@@ -433,6 +433,18 @@ def m_phi_to_g0s0(m, phi):
     return g0, s0
 
 
+def phasor(data : np.ndarray, threshold : float = 0, harmonic : int = 1, 
+           time_axis : int = -1):
+    
+    flux = data.sum(time_axis)
+    transform = np.fft.fft(data, axis = time_axis)[..., harmonic].conj()
+    divide = transform / flux
+    
+    divide[transform < threshold] = 0    
+    
+    return divide
+
+
 def calculate_phasor(data_hist, threshold=1, harmonic=1):
     '''
     :param data_hist: the histogram 1D
@@ -440,9 +452,10 @@ def calculate_phasor(data_hist, threshold=1, harmonic=1):
     :return: phasor: g0 + 1j * s0
     '''
 
-    data = data_hist
+    data = data_hist.copy()
     if len(data.shape) == 1:
-        data_thresholded = np.where(data < 10, data, 0)
+        # data_thresholded = np.where(data < 10, 0, data)
+        data_thresholded = data.copy()
         N = np.sum(data_thresholded)
         if N < threshold:
             return np.nan + 1j * np.nan
@@ -450,10 +463,12 @@ def calculate_phasor(data_hist, threshold=1, harmonic=1):
             f = np.fft.fft(data_thresholded / N)  # FFT of normalized data
             return f[harmonic].conj()  # 1st harmonic
     elif len(data.shape) == 2:
-        data_thresholded = np.where(data < 10, data, 0)
+        # data_thresholded = np.where(data < 10, 0, data)
+        data_thresholded = data.copy()
+
         N = np.sum(data_thresholded, axis=0)
         print(N.shape, data_thresholded.shape)
-        f = np.fft.fft(data_thresholded / N, axis=0)  # FFT of normalized data
+        f = np.fft.fftn(data_thresholded / N, axis=0)  # FFT of normalized data
         print(f.shape)
         out = f[harmonic]
         out[N < threshold * np.ones(data_thresholded.shape[1])] = np.nan + 1j * np.nan
@@ -594,7 +609,7 @@ def calculate_phasor_on_img_pixels(data_path, data_input, threshold=1, harmonic=
     :param phasor_pix_data_size: slice of pixels on which the phasors are computed
     :return: out G=[r,z,y,x,y,0] S=[r,z,y,x,y,1]
     '''
-    data_input_3d = np.sum(data_input, axis=3)
+    data_input_3d = data_input.copy()  ###
     data_input_shape = data_input_3d.shape
 
     # Extract directory and filename from the provided data_path
@@ -610,7 +625,8 @@ def calculate_phasor_on_img_pixels(data_path, data_input, threshold=1, harmonic=
         raise ValueError("data_input must have 3 or more dimensions")
     elif len(data_input_shape) >= 6:
         raise ValueError("use calculate_phasor_on_img_ch() instead")
-
+        
+    
     with h5py.File(new_file_path, 'w') as fil:
 
         # Create an empty dataset with the specified dimensions in dataset_shape
@@ -618,6 +634,7 @@ def calculate_phasor_on_img_pixels(data_path, data_input, threshold=1, harmonic=
         h5_dim = (x_dim, y_dim)
         h5_dataset_phasor_pix = fil.create_dataset('h5_dataset_phasor_pix', shape=h5_dim, dtype=np.complex128)
         h5_dataset_phasor_pix[:] = np.zeros(h5_dim, dtype=np.complex128)
+        phasor_pix = np.empty(h5_dim, dtype = np.complex128)
 
         for x_start in range(0, x_dim, phasor_pix_data_size):
             for y_start in range(0, y_dim, phasor_pix_data_size):
@@ -637,8 +654,14 @@ def calculate_phasor_on_img_pixels(data_path, data_input, threshold=1, harmonic=
                         aligned_phasor_pix[yyy, xxx] = calculate_phasor(sub_image_pix[yyy, xxx, :],
                                                                         threshold,
                                                                         harmonic)
+                        phasor_pix[yyy,xxx] = calculate_phasor(sub_image_pix[yyy, xxx, :],
+                                                                        threshold,
+                                                                        harmonic)
                 h5_dataset_phasor_pix[x_start:x_stop, y_start:y_stop] = aligned_phasor_pix
+                phasor_pix[x_start:x_stop, y_start:y_stop]= aligned_phasor_pix
     fil.close()
+    
+    return phasor_pix
 
 
 def plot_tau(list_value=None, dfd_freq=21e6, ax=None):
