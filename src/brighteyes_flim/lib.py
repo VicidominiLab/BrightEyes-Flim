@@ -14,6 +14,8 @@ import brighteyes_ism.dataio.mcs as mcs
 import brighteyes_ism.analysis.APR_lib as apr
 from skimage.filters import threshold_otsu as otsu
 
+from scipy.ndimage import shift
+
 
 class FlimData:
 
@@ -278,15 +280,6 @@ class FlimData:
 
         return self.correction_coeff
 
-    # def phasors_corrected(self, coeff=1., laser_correction=True):
-    #    if self.phasors is None:
-    #       raise (ValueError("call before calculate_phasor_on_img_ch(...)"))
-
-    #  if laser_correction:
-    #     return self.phasors * coeff * np.exp(1j * (-np.angle(self.phasor_laser)))
-    # else:
-    #    return self.phasors * coeff
-
     def phasor_global_corrected(self, coeff=1., laser_correction=True):
         if laser_correction:
             return self.phasors_global * coeff * np.exp(1j * (-np.angle(self.phasor_laser)))
@@ -299,11 +292,6 @@ class FlimData:
         else:
             return self.phasors_global_irf * coeff
 
-    # def calculate_phasor_for_image_channels(self):
-    # [shift, phasor_on_channels, phasors_irf] = self.calculate_irf_correction()
-    #
-
-    # plt.show()
 
 
 # class FlimCalibrateData:
@@ -934,8 +922,23 @@ def showFLIM(
 
 def linear_shift(data, shift, cyclic=True):
     xp = np.arange(0, data.shape[0])
-    fp = data
+    fp = data.copy()
     x = np.arange(0, data.shape[0]) - shift
     if cyclic:
         x = np.mod(x, data.shape[0])
     return np.interp(x, xp, fp)
+
+
+def compute_shift(data_path, dfd_freq=21e6):
+    data = h5py.File(data_path)
+    metadata = mcs.metadata_load(data_path)  # data_format = 'h5'
+    data_extra, _ = mcs.load(data_path, key="data_channels_extra")
+    data_laser = data_extra[:, :, :, :, :, 1]
+    image = data["data"]
+    data_laser_hist = np.sum(data_laser, axis=(0, 1, 2, 3))
+    phasor_laser = calculate_phasor(data_laser_hist)
+    shift_term = -np.angle(phasor_laser) / dfd_freq
+    image_shifted = shift(image, (0, 0, 0, 0, shift_term, 0))
+    return image_shifted
+
+
