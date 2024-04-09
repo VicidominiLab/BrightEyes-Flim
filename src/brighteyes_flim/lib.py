@@ -440,7 +440,7 @@ def phasor(data : np.ndarray, threshold : float = 0, harmonic : int = 1,
     transform = np.fft.fft(data, axis = time_axis)[..., harmonic].conj()
     divide = transform / flux
     
-    divide[transform < threshold] = 0    
+    divide[flux < threshold] = 0
     
     return divide
 
