@@ -929,16 +929,19 @@ def linear_shift(data, shift, cyclic=True):
     return np.interp(x, xp, fp)
 
 
-def compute_shift(data_path, dfd_freq=21e6):
-    data = h5py.File(data_path)
-    metadata = mcs.metadata_load(data_path)  # data_format = 'h5'
+def compute_shift(data_path, dfd_freq=21e6, axis=-2):
+    data, meta = mcs.load(data_path)
     data_extra, _ = mcs.load(data_path, key="data_channels_extra")
+
     data_laser = data_extra[:, :, :, :, :, 1]
-    image = data["data"]
     data_laser_hist = np.sum(data_laser, axis=(0, 1, 2, 3))
     phasor_laser = calculate_phasor(data_laser_hist)
     shift_term = -np.angle(phasor_laser) / dfd_freq
-    image_shifted = shift(image, (0, 0, 0, 0, shift_term, 0))
-    return image_shifted
+
+    shift_array = np.zeros(data.ndim)
+    shift_array[axis] = shift_term
+    data_shifted = shift(data, shift_array)
+
+    return data_shifted, meta
 
 
