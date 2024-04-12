@@ -891,4 +891,11 @@ def compute_shift(data_path, dfd_freq=41.48e6, axis=-2):
 
     return data_shifted, meta
 
+def correction_phasor(laser, laser_irf):
+    phasor_laser = phasor(laser)
+    phasor_laser_irf = phasor(laser_irf)
 
+    angle_laser = np.angle(phasor_laser)
+    angle_laser_irf = np.angle(phasor_laser_irf)
+
+    return np.exp(-1j * (angle_laser - angle_laser_irf))
