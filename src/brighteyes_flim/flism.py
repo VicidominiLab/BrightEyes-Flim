@@ -2,7 +2,7 @@ import numpy as np
 from matplotlib import colors
 from matplotlib.pyplot import gca
 from matplotlib.colors import hsv_to_rgb
-from matplotlib_scalebar.scalebar import ScaleBar
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 from tqdm.auto import tqdm
 
@@ -699,10 +699,10 @@ def plot_phasor(phasors, bins_2dplot=100, log_scale=True, draw_universal_circle=
         plot_universal_circle(ax, quadrant)
 
     if log_scale:
-        _ = ax.hist2d(np.real(phasors_flat), np.imag(phasors_flat), range=[[-1, 1], [-1, 1]], bins=bins_2dplot,
+        im = ax.hist2d(np.real(phasors_flat), np.imag(phasors_flat), range=[[-1, 1], [-1, 1]], bins=bins_2dplot,
                       norm=colors.LogNorm(), cmap=cmap)
     else:
-        _ = ax.hist2d(np.real(phasors_flat), np.imag(phasors_flat), range=[[-1, 1], [-1, 1]], bins=bins_2dplot,
+        im = ax.hist2d(np.real(phasors_flat), np.imag(phasors_flat), range=[[-1, 1], [-1, 1]], bins=bins_2dplot,
                       cmap=cmap)
 
     if quadrant == 'all':
@@ -719,6 +719,13 @@ def plot_phasor(phasors, bins_2dplot=100, log_scale=True, draw_universal_circle=
     ax.set_ylabel('s')
 
     ax.set_aspect('equal', 'box')
+
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes("right", size="5%", pad=0.05)
+    plt.colorbar(im[-1], cax=cax)
+    cax.set_ylabel('Pixel counts')
+
+    fig.tight_layout()
 
     return fig, ax
 
