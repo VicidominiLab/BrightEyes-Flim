@@ -19,7 +19,7 @@ from scipy.ndimage import shift
 class FlimData:
 
     def __init__(self, data_path: str = None, data_path_irf: str = None,
-                 freq_exc: float = 21e6, correction_coeff: complex = None, step_size: int = None,
+                 freq_exc: float = 41.48e6, correction_coeff: complex = None, step_size: int = None,
                  sub_image_dim: int = 100, pre_filter: str = None):
         '''
 
@@ -93,10 +93,10 @@ class FlimData:
         if data_path is not None:
             self.load_data_irf(data_path_irf, sub_image_size=self.sub_image_dim)
             self.load_data(data_path, sub_image_size=self.sub_image_dim)
-            self.calculate_phasor_global_irf()
-            self.calculate_phasor_global()
-            self.calculate_phasor_laser()
-            self.calculate_phasor_laser_irf()
+            self.phasor_global_irf()
+            self.phasor_global()
+            self.phasor_laser()
+            self.phasor_laser_irf()
             self.save_aligned_histogram_per_pixel(data_path, sub_image_size=self.sub_image_dim)
 
         if pre_filter is not None:
@@ -234,37 +234,37 @@ class FlimData:
                     :] = aligned_sub_image
         f.close()
 
-    def calculate_phasor_global(self):
-        self.phasors_global = calculate_phasor(self.data_hist)
+    def phasor_global(self):
+        self.phasors_global = phasor(self.data_hist)
         return self.phasors_global
 
-    def calculate_phasor_global_irf(self):
-        self.phasors_global_irf = calculate_phasor(self.data_hist_irf)
+    def phasor_global_irf(self):
+        self.phasors_global_irf = phasor(self.data_hist_irf)
         return self.phasors_global_irf
 
-    def calculate_phasor_laser(self):
-        self.phasor_laser = calculate_phasor(self.data_laser_hist)
+    def phasor_laser(self):
+        self.phasor_laser = phasor(self.data_laser_hist)
         return self.phasor_laser
 
-    def calculate_phasor_laser_irf(self):
-        self.phasor_laser_irf = calculate_phasor(self.data_laser_hist_irf)
+    def phasor_laser_irf(self):
+        self.phasor_laser_irf = phasor(self.data_laser_hist_irf)
         return self.phasor_laser_irf
 
     # def apply_laser_phasor(self):
     #     if self.phasor_laser is None:
-    #         self.calculate_phasor_laser()
+    #         self.phasor_laser()
     #     normalized_phase = self.phasor_laser / abs(self.phasor_laser)
     #     self.phasors = self.phasors / normalized_phase
     #
     #     if self.phasors_global is None:
-    #         self.phasors_global = calculate_phasor_global()
+    #         self.phasors_global = phasor_global()
     #     self.phasors_global = self.phasors_global / normalized_phase
     #
     #     print("applied_laser_phasor")
     #
     #     return self.phasors
 
-    def calculate_correction_coeff(self, dfd_freq=21e6, tau=10e-9):
+    def calculate_correction_coeff(self, dfd_freq=41.48e6, tau=10e-9):
         dfd_time = 1. / dfd_freq
 
         ppp = self.phasors_global / abs(self.phasors_global)
@@ -295,7 +295,7 @@ class FlimData:
 
 # class FlimCalibrateData:
 #
-#     def __init__(self, data_path: str, calibration_path: str, freq_exc: float = 21e6):
+#     def __init__(self, data_path: str, calibration_path: str, freq_exc: float = 41.48e6):
 #         self.freq_exc = freq_exc
 #         self.load_data(data_path)
 #         self.data = None
@@ -322,11 +322,11 @@ class FlimData:
 #         pass
 #
 #     def calculate_calib_phasor(self, laser_registration=True):
-#         calculate_phasor(self.calib_ref)
+#         phasor(self.calib_ref)
 
 def correct_phasor(phasor_data, laser_phasor, coeff=1., laser_correction=True):
     if phasor_data is None:
-        raise (ValueError("call before calculate_phasor_on_img_ch(...)"))
+        raise (ValueError("call before phasor_on_img_ch(...)"))
 
     if laser_correction:
         return phasor_data * coeff * np.exp(1j * (-np.angle(laser_phasor)))
@@ -363,22 +363,22 @@ def sum_adjacent_pixel(data, n=4):
         return d
 
 
-def plot_universal_circle(ax=None):
+def plot_universal_circle(ax=None, quadrant='all'):
     '''
     draw the universal circle in the last plot
     '''
     if ax is None:
         ax = gca()
-    n = np.linspace(0, 2 * np.pi)
+    n = np.linspace(0, np.pi, num=100)
     g = 0.5 * (np.cos(n) + 1)
     s = 0.5 * np.sin(n)
     ax.plot(g, s, "--")
-    n = np.linspace(0, 2 * np.pi)
-    g = np.cos(n)
-    s = np.sin(n)
-    ax.plot(g, s, "--")
-    ax.plot([-1.1, 1.1], [0, 0], "--k")
-    ax.plot([0, 0], [-1.1, 1.1], "--k")
+    if quadrant == 'all':
+        g = np.cos(n)
+        s = np.sin(n)
+        ax.plot(g, s, "--")
+        ax.plot([-1.1, 1.1], [0, 0], "--k")
+        ax.plot([0, 0], [-1.1, 1.1], "--k")
 
 
 def flatten_and_remove_nan(a, b=None):
@@ -430,7 +430,7 @@ def phasor(data : np.ndarray, threshold : float = 0, harmonic : int = 1,
     return np.where(flux<threshold, np.nan+1j*np.nan ,transform / flux)
     
 
-def calculate_tau_phi(g0_or_complex, s0=None, dfd_freq=21e6):
+def calculate_tau_phi(g0_or_complex, s0=None, dfd_freq=41.48e6):
     if s0 is None:
         phi = np.angle(g0_or_complex)
         m = np.abs(g0_or_complex)
@@ -444,7 +444,7 @@ def calculate_tau_phi(g0_or_complex, s0=None, dfd_freq=21e6):
     return tau_phi
 
 
-def calculate_tau_m(g0_or_complex, s0=None, dfd_freq=21e6):
+def calculate_tau_m(g0_or_complex, s0=None, dfd_freq=41.48e6):
     if s0 is None:
         # phi = np.angle(g0_or_complex)
         m = np.abs(g0_or_complex)
@@ -458,7 +458,7 @@ def calculate_tau_m(g0_or_complex, s0=None, dfd_freq=21e6):
     return tau_m
 
 
-def calculate_m_phi_tau_phi_tau_m(g0_or_complex, s0=None, dfd_freq=21e6):
+def calculate_m_phi_tau_phi_tau_m(g0_or_complex, s0=None, dfd_freq=41.48e6):
     if s0 is None:
         phi = np.angle(g0_or_complex)
         m = np.abs(g0_or_complex)
@@ -473,7 +473,7 @@ def calculate_m_phi_tau_phi_tau_m(g0_or_complex, s0=None, dfd_freq=21e6):
     return phi, m, tau_phi, tau_m
 
 
-def calculate_phasor_on_img_ch(data_input, threshold=1, harmonic=1, phasor_data_size=100):
+def phasor_on_img_ch(data_input, threshold=1, harmonic=1, phasor_data_size=100):
     '''
 
     :param data_input: data_input [r, z, y, x, t, ch]
@@ -507,7 +507,7 @@ def calculate_phasor_on_img_ch(data_input, threshold=1, harmonic=1, phasor_data_
                 for cc in np.arange(sub_image_p.shape[-1]):
                     for yy in np.arange(sub_image_p.shape[-4]):
                         for xx in np.arange(sub_image_p.shape[-3]):
-                            aligned_phasor[yy, xx, cc] = calculate_phasor(sub_image_p[yy, xx, :, cc],
+                            aligned_phasor[yy, xx, cc] = phasor(sub_image_p[yy, xx, :, cc],
                                                                           threshold,
                                                                           harmonic)
                 h5_dataset_p[x_start:x_stop, y_start:y_stop,
@@ -515,7 +515,7 @@ def calculate_phasor_on_img_ch(data_input, threshold=1, harmonic=1, phasor_data_
     fi.close()
 
 
-def calculate_phasor_on_img(data_input, threshold=1, harmonic=1):
+def phasor_on_img(data_input, threshold=1, harmonic=1):
     '''
 
     :param data_input: data_input [y, x, t] or [z, y, x, t] or [r, z, y, x, t]
@@ -529,7 +529,7 @@ def calculate_phasor_on_img(data_input, threshold=1, harmonic=1):
     if len(data_input_shape) <= 3:
         raise ValueError("data_input must have 3 or more dimensions")
     elif len(data_input_shape) >= 6:
-        raise ValueError("use calculate_phasor_on_img_ch() instead")
+        raise ValueError("use phasor_on_img_ch() instead")
 
     if len(data_input_shape) == 3:
         data_input = data_input[None, None, :, :, :]
@@ -542,7 +542,7 @@ def calculate_phasor_on_img(data_input, threshold=1, harmonic=1):
         for zz in tqdm(np.arange(data_input.shape[-4])):
             for yy in tqdm(np.arange(data_input.shape[-3])):
                 for xx in np.arange(data_input.shape[-2]):
-                    out[rr, zz, yy, xx] = calculate_phasor(data_input[rr, zz, yy, xx, :], threshold, harmonic)
+                    out[rr, zz, yy, xx] = phasor(data_input[rr, zz, yy, xx, :], threshold, harmonic)
 
     if len(data_input_shape) == 3:
         out = out[0, 0, :, :, :]
@@ -552,7 +552,7 @@ def calculate_phasor_on_img(data_input, threshold=1, harmonic=1):
     return out
 
 
-def calculate_phasor_on_img_pixels(data_path, data_input, threshold=1, harmonic=1, phasor_pix_data_size=100):
+def phasor_on_img_pixels(data_path, data_input, threshold=1, harmonic=1, phasor_pix_data_size=100):
     '''
 
     :param data_path: path of the analyzed sample
@@ -577,7 +577,7 @@ def calculate_phasor_on_img_pixels(data_path, data_input, threshold=1, harmonic=
     if len(data_input_shape) < 3:
         raise ValueError("data_input must have 3 or more dimensions")
     elif len(data_input_shape) >= 6:
-        raise ValueError("use calculate_phasor_on_img_ch() instead")
+        raise ValueError("use phasor_on_img_ch() instead")
         
     
     with h5py.File(new_file_path, 'w') as fil:
@@ -604,10 +604,10 @@ def calculate_phasor_on_img_pixels(data_path, data_input, threshold=1, harmonic=
                 #   for zz in tqdm(np.arange(data_input.shape[-5]), leave=False):
                 for yyy in np.arange(sub_image_pix.shape[-3]):
                     for xxx in np.arange(sub_image_pix.shape[-2]):
-                        aligned_phasor_pix[yyy, xxx] = calculate_phasor(sub_image_pix[yyy, xxx, :],
+                        aligned_phasor_pix[yyy, xxx] = phasor(sub_image_pix[yyy, xxx, :],
                                                                         threshold,
                                                                         harmonic)
-                        phasor_pix[yyy,xxx] = calculate_phasor(sub_image_pix[yyy, xxx, :],
+                        phasor_pix[yyy,xxx] = phasor(sub_image_pix[yyy, xxx, :],
                                                                         threshold,
                                                                         harmonic)
                 h5_dataset_phasor_pix[x_start:x_stop, y_start:y_stop] = aligned_phasor_pix
@@ -617,7 +617,7 @@ def calculate_phasor_on_img_pixels(data_path, data_input, threshold=1, harmonic=
     return phasor_pix
 
 
-def plot_tau(list_value=None, dfd_freq=21e6, ax=None):
+def plot_tau(list_value=None, dfd_freq=41.48e6, ax=None):
     '''
     :param list_value: values to draw on the universal circle, default = np.arange(10) * 1e-9
     :param dfd_freq:
@@ -628,7 +628,7 @@ def plot_tau(list_value=None, dfd_freq=21e6, ax=None):
         ax = gca()
 
     if list_value is None:
-        list_value = np.array([1, 2, 3, 4, 5, 7, 9, 12, 18]) * 1e-9
+        list_value = np.array([1, 2, 3, 4, 6, 9, 16]) * 1e-9
 
     for i in list_value:
         x0 = np.cos(np.arctan(2 * np.pi * i * dfd_freq))
@@ -648,7 +648,7 @@ def plot_tau(list_value=None, dfd_freq=21e6, ax=None):
         y = [0, y0]
 
         m, phi = g0s0_to_m_phi(x0, y0)
-        ax.plot(x, y, ".-y")
+        ax.plot(x, y, ".k")
 
         gamma = np.arctan2(y0, x0 - 0.5)  # the angle in the small circle used for add label
 
@@ -665,6 +665,7 @@ def plot_funny_single_phasor(data, correction_phi=0, correction_m=1., ax=None):
     :param correction_m:
     :return:
     '''
+
     N = sum(data)
     l = data.shape[0]
     w = np.linspace(0, 2 * np.pi, l)
@@ -679,20 +680,23 @@ def plot_funny_single_phasor(data, correction_phi=0, correction_m=1., ax=None):
     ax.plot(np.cos(np.linspace(0, 2 * np.pi)), np.sin(np.linspace(0, 2 * np.pi)))
 
 
-def plot_phasor(phasors, bins_2dplot=50, log_scale=True, draw_universal_circle=True, tau_labels=True, ax=None,
-                dfd_freq=21e6, cmap='viridis'):
+def plot_phasor(phasors, bins_2dplot=100, log_scale=True, draw_universal_circle=True, tau_labels=True, quadrant='all',
+                fig=None, ax=None, dfd_freq=41.48e6, cmap='viridis'):
     '''
     :param phasors:
     :param log_scale:
     :param bins_2dplot:
     :return:
     '''
-    if ax is None:
+
+    if fig is None:
+        fig, ax = plt.subplots()
+    elif fig is not None and ax is None:
         ax = gca()
     phasors_flat = flatten_and_remove_nan(phasors)
 
     if draw_universal_circle == True:
-        plot_universal_circle(ax)
+        plot_universal_circle(ax, quadrant)
 
     if log_scale:
         _ = ax.hist2d(np.real(phasors_flat), np.imag(phasors_flat), range=[[-1, 1], [-1, 1]], bins=bins_2dplot,
@@ -701,12 +705,19 @@ def plot_phasor(phasors, bins_2dplot=50, log_scale=True, draw_universal_circle=T
         _ = ax.hist2d(np.real(phasors_flat), np.imag(phasors_flat), range=[[-1, 1], [-1, 1]], bins=bins_2dplot,
                       cmap=cmap)
 
-    ax.set_xlim(-1.1, 1.1)
-    ax.set_ylim(-1.1, 1.1)
+    if quadrant == 'all':
+        ax.set_xlim(-1.1, 1.1)
+        ax.set_ylim(-1.1, 1.1)
+    elif quadrant == 'first':
+        ax.set_xlim(-0.05, 1.05)
+        ax.set_ylim(0, 0.6)
 
     if tau_labels == True:
         plot_tau(ax=ax, dfd_freq=dfd_freq)
 
+    ax.set_aspect('equal', 'box')
+
+    return fig, ax
 
 def fourier_shift(data, shift_angle=0.):
     if len(data.shape) == 1:
@@ -862,13 +873,13 @@ def linear_shift(data, shift, cyclic=True):
     return np.interp(x, xp, fp)
 
 
-def compute_shift(data_path, dfd_freq=21e6, axis=-2):
+def compute_shift(data_path, dfd_freq=41.48e6, axis=-2):
     data, meta = mcs.load(data_path)
     data_extra, _ = mcs.load(data_path, key="data_channels_extra")
 
     data_laser = data_extra[:, :, :, :, :, 1]
     data_laser_hist = np.sum(data_laser, axis=(0, 1, 2, 3))
-    phasor_laser = calculate_phasor(data_laser_hist)
+    phasor_laser = phasor(data_laser_hist)
     shift_term = -np.angle(phasor_laser) / dfd_freq
 
     shift_array = np.zeros(data.ndim)
