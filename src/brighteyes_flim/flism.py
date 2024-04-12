@@ -715,6 +715,9 @@ def plot_phasor(phasors, bins_2dplot=100, log_scale=True, draw_universal_circle=
     if tau_labels == True:
         plot_tau(ax=ax, dfd_freq=dfd_freq)
 
+    ax.set_xlabel('g')
+    ax.set_ylabel('s')
+
     ax.set_aspect('equal', 'box')
 
     return fig, ax
