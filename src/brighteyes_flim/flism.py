@@ -800,3 +800,10 @@ def correction_phasor(laser, laser_irf):
     angle_laser_irf = np.angle(phasor_laser_irf)
 
     return np.exp(-1j * (angle_laser - angle_laser_irf))
+
+def threshold_phasor(intensity_map, phasor_map, threshold = 0.15):
+    max_counts = intensity_map.max()
+    idx = intensity_map > threshold * max_counts
+    thresholded_phasor = phasor_map[idx].ravel()
+
+    return thresholded_phasor
