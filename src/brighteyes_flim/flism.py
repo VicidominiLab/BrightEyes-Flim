@@ -11,15 +11,13 @@ import matplotlib.pyplot as plt
 import os
 
 import brighteyes_ism.dataio.mcs as mcs
-from skimage.filters import threshold_otsu as otsu
 
-from scipy.ndimage import shift
 
 
 class FlimData:
 
     def __init__(self, data_path: str = None, data_path_irf: str = None,
-                 freq_exc: float = 41.4e6, correction_coeff: complex = None, step_size: int = None,
+                 freq_exc: float = 41.48e6, correction_coeff: complex = None, step_size: int = None,
                  sub_image_dim: int = 100, pre_filter: str = None):
         '''
 
@@ -46,13 +44,16 @@ class FlimData:
 
         self.bin_number = 81
 
-        # The global histogram (for each ch.)
         if data_path is not None:
             with h5py.File(data_path, "r") as hf:
                 if "data" in hf.keys():
                     img = hf["data"]
-                    self.bin_number = img.shape[4]
-                    self.channel_number = img.shape[5]
+                    self.bin_number = img.shape[-2]
+                    self.channel_number = img.shape[-1]
+                elif "dataset_1" in hf.keys():
+                    img = hf["dataset_1"]
+                    self.bin_number = img.shape[-2]
+                    self.channel_number = img.shape[-1]
 
         self.data_hist = np.zeros((self.bin_number, self.channel_number))
 
@@ -91,35 +92,38 @@ class FlimData:
         self.step_size = step_size
 
         if data_path is not None:
-            self.load_data_irf(data_path_irf, sub_image_size=self.sub_image_dim)
-            self.load_data(data_path, sub_image_size=self.sub_image_dim)
+            self.load_data_irf(data_path_irf)
+            self.load_data(data_path)
+            if pre_filter is not None:
+
+                if isinstance(pre_filter, str):
+                    if pre_filter == "normalize":
+                        self.data_hist = ((self.data_hist - np.nanmin(self.data_hist.T, axis=1)) /
+                                          (np.nanmax(self.data_hist.T, axis=1) - np.nanmin(self.data_hist.T, axis=1)))
+                        self.data_hist_irf = ((self.data_hist_irf - np.nanmin(self.data_hist_irf.T, axis=1)) /
+                                              (np.nanmax(self.data_hist_irf.T, axis=1) - np.nanmin(self.data_hist_irf.T,
+                                                                                                   axis=1)))
+                elif type(pre_filter) is int or type(pre_filter) is float:
+                    threshold = pre_filter
+                    nnn = self.data_hist / np.max(self.data_hist, axis=0)
+                    nnn[nnn < threshold] = 1. / np.max(self.data_hist[nnn < threshold], axis=0)
+                    self.data_hist = nnn
+                    mmm = self.data_hist_irf / np.max(self.data_hist_irf, axis=0)
+                    mmm[mmm < threshold] = 1. / np.max(self.data_hist_irf[mmm < threshold], axis=0)
+                    self.data_hist_irf = mmm
+                    print("used pre_filter ", threshold)
+                else:
+                    pre_filter = None
+                    print("Wrong pre_filter parameter", pre_filter, type(pre_filter))
             self.calculate_phasor_global_irf()
             self.calculate_phasor_global()
+            print("phasor global", self.phasors_global)
+            print("phasor global irf", self.phasors_global_irf)
             self.calculate_phasor_laser()
             self.calculate_phasor_laser_irf()
-            self.save_aligned_histogram_per_pixel(data_path, sub_image_size=self.sub_image_dim)
+            print("phasor laser", self.phasor_laser)
+            print("phasor laser irf", self.phasor_laser_irf)
 
-        if pre_filter is not None:
-
-            if isinstance(pre_filter, str):
-                if pre_filter == "normalize":
-                    self.data_hist = ((self.data_hist - np.nanmin(self.data_hist.T, axis=1)) /
-                                      (np.nanmax(self.data_hist.T, axis=1) - np.nanmin(self.data_hist.T, axis=1)))
-                    self.data_hist_irf = ((self.data_hist_irf - np.nanmin(self.data_hist_irf.T, axis=1)) /
-                                          (np.nanmax(self.data_hist_irf.T, axis=1) - np.nanmin(self.data_hist_irf.T,
-                                                                                               axis=1)))
-            elif type(pre_filter) is int or type(pre_filter) is float:
-                threshold = pre_filter
-                nnn = self.data_hist / np.max(self.data_hist, axis=0)
-                nnn[nnn < threshold] = 1. / np.max(self.data_hist[nnn < threshold], axis=0)
-                self.data_hist = nnn
-                mmm = self.data_hist_irf / np.max(self.data_hist_irf, axis=0)
-                mmm[mmm < threshold] = 1. / np.max(self.data_hist_irf[mmm < threshold], axis=0)
-                self.data_hist_irf = mmm
-                print("used pre_filter ", threshold)
-            else:
-                pre_filter = None
-                print("Wrong pre_filter parameter", pre_filter, type(pre_filter))
 
         if correction_coeff is not None:
             if isinstance(correction_coeff, list) or \
@@ -131,16 +135,16 @@ class FlimData:
         # print("Global", self.phasors_global)
         # print("Laser", self.phasor_laser)
 
-    def load_data(self, data_path: str, sub_image_size: int):
+    def load_data(self, data_path: str):
         self.data = h5py.File(data_path)
         self.metadata = mcs.metadata_load(data_path)  # data_format = 'h5'
         data_extra, _ = mcs.load(data_path, key="data_channels_extra")
         data_laser = data_extra[:, :, :, :, :, 1]
         image = self.data["data"]
         self.data_laser_hist = np.sum(data_laser, axis=(0, 1, 2, 3))
-        self.data_hist += np.sum(image, axis=(0, 1, 2, 3))
+        self.data_hist = np.sum(image, axis=(0, 1, 2, 3))
 
-    def load_data_irf(self, data_path_irf: str, sub_image_size: int):
+    def load_data_irf(self, data_path_irf: str):
         self.data_irf = h5py.File(data_path_irf)
         self.metadata_irf = mcs.metadata_load(data_path_irf)  # data_format = 'h5'
         data_extra_irf, _ = mcs.load(data_path_irf, key="data_channels_extra")
@@ -149,74 +153,20 @@ class FlimData:
         self.data_hist_irf = np.sum(image_irf, axis=(0, 1, 2, 3))
         self.data_laser_hist_irf = np.sum(data_laser_irf, axis=(0, 1, 2, 3))
 
-    def calculate_irf_correction(self):
-        phasors_shifted = self.phasor_global_corrected_irf()
-        phasor_forced = 1.
-        phasor_total = self.phasor_global_corrected(phasor_forced / phasors_shifted)
-        irf_term = -self.bin_number * np.angle(phasor_forced / phasors_shifted / phasor_total) / (2 * np.pi)
-        return [irf_term, phasor_total, phasors_shifted]
-
-    def save_aligned_histogram_per_pixel(self, data_path: str, sub_image_size: int, cyclic=True):
-        print("start data saving")
-        [shift, phasor_on_channels, phasors_irf] = self.calculate_irf_correction()
-        print("dimension of the shift term", shift.shape)
-        self.data = h5py.File(data_path)
-        self.metadata = mcs.metadata_load(data_path)  # data_format = 'h5'
-        image = self.data["data"]
-        x_size, y_size, bin_size, channel_size = image.shape[2], image.shape[3], image.shape[4], image.shape[5]
-
-        # Extract directory and filename from the provided data_path
-        directory, filename = os.path.split(data_path)
-        # Remove file extension
-        filename = os.path.splitext(filename)[0]
-
-        # Generate new filename with "aligned" appended
-        new_filename = filename + "_aligned.h5"
-        # Construct full path for the new file
-        new_file_path = os.path.join(directory, new_filename)
-
-        with h5py.File(new_file_path, 'w') as f:
-
-            # Create an empty dataset with the specified dimensions in dataset_shape
-            dataset_shape = (x_size, y_size, bin_size, channel_size)
-            h5_dataset = f.create_dataset('h5_dataset', shape=dataset_shape, dtype=np.uint32)
-            #  h5_dataset[:] = np.zeros(dataset_shape, dtype=np.float16)
-
-            for x_start in range(0, x_size, sub_image_size):
-                for y_start in range(0, y_size, sub_image_size):
-                    x_stop = min(x_start + sub_image_size, x_size)
-                    y_stop = min(y_start + sub_image_size, y_size)
-
-                    slice_term = np.s_[:, :, x_start:x_stop, y_start:y_stop, :, :]
-                    sub_image = image[slice_term]
-                    sub_image = sub_image[0, 0, :, :, :, :]
-
-                    aligned_sub_image = np.zeros(sub_image.shape, dtype=np.uint32)
-
-                    for i in range(sub_image.shape[0]):
-                        for j in range(sub_image.shape[1]):
-                            aligned_sub_image[i, j, :, :] = np.array([linear_shift(sub_image[i, j, :, ch],
-                                                                                   shift[ch], cyclic) for ch in
-                                                                      range(0, image.shape[5])]).T
-
-                    h5_dataset[x_start:x_stop, y_start:y_stop, :,
-                    :] = aligned_sub_image
-        f.close()
-
     def calculate_phasor_global(self):
-        self.phasors_global = phasor(data=self.data_hist, time_axis=0)
+        self.phasors_global = calculate_phasor(data_hist=self.data_hist)
         return self.phasors_global
 
     def calculate_phasor_global_irf(self):
-        self.phasors_global_irf = phasor(data=self.data_hist_irf, time_axis=0)
+        self.phasors_global_irf = calculate_phasor(data_hist=self.data_hist_irf)
         return self.phasors_global_irf
 
     def calculate_phasor_laser(self):
-        self.phasor_laser = phasor(self.data_laser_hist)
+        self.phasor_laser = calculate_phasor(self.data_laser_hist)
         return self.phasor_laser
 
     def calculate_phasor_laser_irf(self):
-        self.phasor_laser_irf = phasor(self.data_laser_hist_irf)
+        self.phasor_laser_irf = calculate_phasor(self.data_laser_hist_irf)
         return self.phasor_laser_irf
 
     # def apply_laser_phasor(self):
@@ -256,7 +206,7 @@ class FlimData:
 
     def phasor_global_corrected_irf(self, coeff=1., laser_correction=True):
         if laser_correction:
-            return self.phasors_global_irf * coeff * np.exp(1j * (-np.angle(self.phasor_laser_irf)))
+            return self.phasors_global_irf * coeff * np.exp(1j * (-np.angle(self.phasor_laser)))
         else:
             return self.phasors_global_irf * coeff
 
@@ -391,13 +341,50 @@ def m_phi_to_g0s0(m, phi):
 
 def phasor(data: np.ndarray, threshold: float = 0, harmonic: int = 1,
            time_axis: int = -1):
-    flux = data.sum(time_axis)
-    if time_axis == -1:
-        transform = np.fft.fft(data, axis=time_axis)[..., harmonic].conj()
-    else:
-        transform = np.fft.fft(data, axis=time_axis)[harmonic, ...].conj()
+    dset = data.copy()
+    flux = dset.sum(time_axis)
+    if time_axis != -1:
+        dset = np.swapaxes(dset, time_axis, -1)
+    transform = np.fft.fft(dset, axis=time_axis)[..., harmonic].conj()
+    if transform.ndim == dset.ndim:
+        transform = np.swapaxes(transform, -1, time_axis)
 
     return np.where(flux < threshold, np.nan + 1j * np.nan, transform / flux)
+
+
+def calculate_phasor(data_hist, threshold: float = 1, harmonic: int = 1):
+    '''
+    :param data_hist: the histogram 1D
+    :param threshold: the minimum of entry of the histogram
+    :return: phasor: g0 + 1j * s0
+    '''
+
+    data = data_hist.copy()
+    if len(data.shape) == 1:
+        # data_thresholded = np.where(data < 10, data, 0)
+        N = np.sum(data)
+        if N < threshold:
+            return np.nan + 1j * np.nan
+        else:
+            f = np.fft.fft(data / N)  # FFT of normalized data
+            return f[harmonic].conj()  # 1st harmonic
+    elif len(data.shape) == 2:
+        # data_thresholded = np.where(data < 10, data, 0)
+        N = np.sum(data, axis=0)
+        print(N.shape, data.shape)
+        f = np.fft.fft(data / N, axis=0)  # FFT of normalized data
+        print(f.shape)
+        out = f[harmonic]
+        out[N < threshold * np.ones(data.shape[1])] = np.nan + 1j * np.nan
+        return out.conj()
+    elif len(data.shape) == 3:
+        flux = data.sum(-1)
+        transform = np.fft.fft(data, axis=-1)[..., harmonic].conj()
+        out = transform / flux
+        out[flux < threshold * np.ones(data.shape[1])] = np.nan + 1j * np.nan
+        return out
+    else:
+        raise ValueError("Wrong input dimension")
 
 
 def calculate_tau_phi(g0_or_complex, s0=None, dfd_freq=41.48e6):
@@ -515,11 +502,11 @@ def phasor_h5(data_path, data_input, harmonic: int = 1):
         h5_dataset_phasor_pix = fil.create_dataset('h5_dataset_phasor_pix', shape=h5_dim, dtype=np.complex128)
         # h5_dataset_phasor_pix[:] = np.zeros(h5_dim, dtype=np.complex128)
 
-        h5_dataset_phasor_pix[:, :] = phasor(data_input_3d[:, :, :],
-                                             harmonic)
+        h5_dataset_phasor_pix[:, :] = calculate_phasor(data_input_3d[:, :, :],
+                                                       harmonic)
         return h5_dataset_phasor_pix
 
-    fil.close
+    fil.close()
 
 
 def calculate_phasor_on_img(data_input, threshold=1, harmonic=1):
@@ -768,29 +755,13 @@ def cmap2d(intensity, lifetime, params):
     return RGB
 
 
-def linear_shift(data, shift, cyclic=True):
+def linear_shift(data, shift_value, cyclic=True):
     xp = np.arange(0, data.shape[0])
     fp = data.copy()
-    x = np.arange(0, data.shape[0]) - shift
+    x = np.arange(0, data.shape[0]) - shift_value
     if cyclic:
         x = np.mod(x, data.shape[0])
     return np.interp(x, xp, fp)
-
-
-def compute_shift(data_path, dfd_freq=41.48e6, axis=-2):
-    data, meta = mcs.load(data_path)
-    data_extra, _ = mcs.load(data_path, key="data_channels_extra")
-
-    data_laser = data_extra[:, :, :, :, :, 1]
-    data_laser_hist = np.sum(data_laser, axis=(0, 1, 2, 3))
-    phasor_laser = phasor(data_laser_hist)
-    shift_term = -np.angle(phasor_laser) / dfd_freq
-
-    shift_array = np.zeros(data.ndim)
-    shift_array[axis] = shift_term
-    data_shifted = shift(data, shift_array)
-
-    return data_shifted, meta
 
 
 def correction_phasor(laser, laser_irf):
