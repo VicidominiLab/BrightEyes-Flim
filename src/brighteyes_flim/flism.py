@@ -3,7 +3,7 @@ from matplotlib import colors
 from matplotlib.pyplot import gca
 from matplotlib.colors import hsv_to_rgb
 from mpl_toolkits.axes_grid1 import make_axes_locatable
-
+from scipy.ndimage import median_filter
 from tqdm.auto import tqdm
 
 import h5py
@@ -11,7 +11,6 @@ import matplotlib.pyplot as plt
 import os
 
 import brighteyes_ism.dataio.mcs as mcs
-
 
 
 class FlimData:
@@ -123,7 +122,6 @@ class FlimData:
             self.calculate_phasor_laser_irf()
             print("phasor laser", self.phasor_laser)
             print("phasor laser irf", self.phasor_laser_irf)
-
 
         if correction_coeff is not None:
             if isinstance(correction_coeff, list) or \
@@ -780,3 +778,13 @@ def threshold_phasor(intensity_map, phasor_map, threshold=0.15):
     thresholded_phasor = phasor_map[idx].ravel()
 
     return thresholded_phasor
+
+
+def median_phasors(phasor_map, window=3):
+    phasors_pix_re = np.real(phasor_map)
+    phasors_pix_im = np.imag(phasor_map)
+    phasors_med_re = median_filter(phasors_pix_re, window)
+    phasors_med_im = median_filter(phasors_pix_im, window)
+    phasors_med = phasors_med_re + 1j * phasors_med_im
+
+    return phasors_med
