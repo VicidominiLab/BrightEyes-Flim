@@ -1,5 +1,9 @@
 BrightEyes-FLIM
 ---------------
 
-BrightEyes-FLIM, the library for Fluorescent Lifetime Imaging Microscopy analysis.
+## Installation
+
+You can install `brighteyes-flim` via [pip] directly from GitHub:
+
+    pip install git+https://github.com/VicidominiLab/BrightEyes-Flim
 
