@@ -773,6 +773,11 @@ def threshold_phasor(intensity_map, phasor_map, threshold=0.15):
 
     return thresholded_phasor
 
+def median_phasors(phasor_map, window=3):
+    filtered_phasors = median_filter(phasor_map, size=window)
+
+    return filtered_phasors
+
 
 def calculate_irf_correction(hist_irf, n_bins):
     phasors_irf = calculate_phasor(hist_irf)
@@ -780,12 +785,6 @@ def calculate_irf_correction(hist_irf, n_bins):
     correction_term = (angle_irf / (2 * np.pi)) * n_bins
 
     return correction_term
-
-
-def median_phasors(phasor_map, window=3):
-    filtered_phasors = median_filter(phasor_map, size=window)
-
-    return filtered_phasors
 
 
 def m_phi_to_complex(m, phi):
