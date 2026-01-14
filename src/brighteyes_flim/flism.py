@@ -937,6 +937,30 @@ def calibrate_phasor(data, data_reference, ch=12, tau_m_reference=2.5 * 10 ** -9
         phasor_corrected_pix_aligned = phasor_pixels_aligned / phasor_irf_sum
         return phasor_corrected_pix_aligned
 
+def show_lifetime_histogram(phasors_calibrated, method='tau_phi', interval=(-2, 6), bin_number=50, dfd_freq=40e6):
+        '''
+        Plot the histogram of the fluorescence lifetime values the analyzed image's pixels
+
+        : param phasors_calibrated: array with phasors in each pixel of the image extracted with calibrate_phasor function
+        : param method: method used for lifetime computation from the phasors
+        : param interval: range of lifetime values shown in the histogram
+        : param bin number: bins of the histogram
+        : dfd_freq: frequency of the pulsed laser source used for fluorescence excitation (in Hz)
+
+        '''
+
+    if method == 'tau_phi':
+        tau_phi = calculate_tau_phi(np.real(phasors_calibrated), np.imag(phasors_calibrated), dfd_freq=dfd_freq)
+        tau_data = 1e9 * tau_phi.flatten()
+        plt.figure()
+        plt.hist(tau_data, range=interval, bins=bin_number)
+
+    if method == 'tau_m':
+        tau_m = calculate_tau_m(np.real(phasors_calibrated), np.imag(phasors_calibrated), dfd_freq=dfd_freq)
+        tau_data = 1e9 * tau_m.flatten()
+        plt.figure()
+        plt.hist(tau_data, range=interval, bins=bin_number)
+
 
 def plot_flim_image(data_4D, phasors_calibrated, method='tau_phi', pxsize=0.04, pxdwelltime=91,
                     lifetime_bounds=(1, 2.5), log_scale=False, dfd_freq=40e6):
@@ -976,28 +1000,7 @@ def plot_flim_image(data_4D, phasors_calibrated, method='tau_phi', pxsize=0.04, 
                       lifetime_bounds=lifetime_bounds, fig=fig, ax=ax2)
         fig.tight_layout()
 
-def show_lifetime_histogram(phasors_calibrated, method='tau_phi', interval=(-2, 6), bin_number=50, dfd_freq=40e6):
-        '''
-        Plot the histogram of the fluorescence lifetime values the analyzed image's pixels
 
-        : param phasors_calibrated: array with phasors in each pixel of the image extracted with calibrate_phasor function
-        : param method: method used for lifetime computation from the phasors
-        : param interval: range of lifetime values shown in the histogram
-        : param bin number: bins of the histogram
-        : dfd_freq: frequency of the pulsed laser source used for fluorescence excitation (in Hz)
-
-        '''
-    if method == 'tau_phi':
-        tau_phi = calculate_tau_phi(np.real(phasors_calibrated), np.imag(phasors_calibrated), dfd_freq=dfd_freq)
-        tau_data = 1e9 * tau_phi.flatten()
-        plt.figure()
-        plt.hist(tau_data, range=interval, bins=bin_number)
-
-    if method == 'tau_m':
-        tau_m = calculate_tau_m(np.real(phasors_calibrated), np.imag(phasors_calibrated), dfd_freq=dfd_freq)
-        tau_data = 1e9 * tau_m.flatten()
-        plt.figure()
-        plt.hist(tau_data, range=interval, bins=bin_number)
 
 
 
