@@ -903,7 +903,17 @@ def calibrate_phasor(data, data_reference, ch=12, tau_m_reference=2.5 * 10 ** -9
         phi_ref = math.atan2(tau_phi_reference, k)
         m_ref = np.sqrt(1 / (((tau_m_reference * k) ** 2) + 1))
         m_irf = 1
-        phi_irf = np.abs(m_phi_calibration[:, 1] - phi_ref)
+        if np.real(phasor_calibration[12]) < 0 and np.imag(phasor_calibration[12]) > 0:
+           phi_irf = -(np.abs(m_phi_calibration[:, 1] - phi_ref))
+
+        if np.real(phasor_calibration[12]) > 0 and np.imag(phasor_calibration[12]) > 0:
+           phi_irf = -(np.abs(m_phi_calibration[:, 1] - phi_ref))
+
+        if np.real(phasor_calibration[12]) > 0 and np.imag(phasor_calibration[12]) < 0:
+           phi_irf = (np.abs(m_phi_calibration[:, 1] - phi_ref))
+
+        if np.real(phasor_calibration[12]) < 0 and np.imag(phasor_calibration[12]) < 0:
+           phi_irf = (np.abs(m_phi_calibration[:, 1] - phi_ref))
 
         phasor_irf = np.zeros((nch), dtype=complex)
         for i in range(nch):
@@ -928,7 +938,19 @@ def calibrate_phasor(data, data_reference, ch=12, tau_m_reference=2.5 * 10 ** -9
         k = 1 / (2 * np.pi * laser_Hz * h)
         phi_ref = math.atan2(tau_phi_reference, k)
         m_irf_sum = 1
-        phi_irf_sum = np.abs(m_phi_calibration_sum[1] - phi_ref)
+
+        if np.real(phasor_calibration_sum) < 0 and np.imag(phasor_calibration_sum) > 0:
+           phi_irf_sum = -(np.abs(m_phi_calibration_sum[-1] - phi_ref))
+
+        if np.real(phasor_calibration_sum) > 0 and np.imag(phasor_calibration_sum) > 0:
+           phi_irf_sum = -(np.abs(m_phi_calibration_sum[-1] - phi_ref))
+
+        if np.real(phasor_calibration_sum) > 0 and np.imag(phasor_calibration_sum) < 0:
+           phi_irf_sum = (np.abs(m_phi_calibration_sum[-1] - phi_ref))
+
+        if np.real(phasor_calibration_sum) < 0 and np.imag(phasor_calibration_sum) < 0:
+           phi_irf_sum = (np.abs(m_phi_calibration_sum[-1] - phi_ref))
+
         phasor_irf_sum = m_phi_to_complex(m_irf_sum, phi_irf_sum)
 
         data_aligned_3D = np.sum(data_aligned_final, axis=-1)
