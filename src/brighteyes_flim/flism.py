@@ -6,6 +6,8 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 from scipy.ndimage import median_filter
 from tqdm.auto import tqdm
 import math
+from skimage.registration import phase_cross_correlation
+from scipy.ndimage import shift
 
 import h5py
 import matplotlib.pyplot as plt
@@ -961,17 +963,16 @@ def calibrate_phasor(data, data_reference, ch=12, tau_m_reference=2.5 * 10 ** -9
         return phasor_corrected_pix_aligned
 
 def show_lifetime_histogram(phasors_calibrated, method='tau_phi', interval=(-2, 6), bin_number=50, dfd_freq=40e6):
+    '''
+    Plot the histogram of the fluorescence lifetime values the analyzed image's pixels
+
+    : param phasors_calibrated: array with phasors in each pixel of the image extracted with calibrate_phasor function
+    : param method: method used for lifetime computation from the phasors
+    : param interval: range of lifetime values shown in the histogram
+    : param bin number: bins of the histogram
+    : dfd_freq: frequency of the pulsed laser source used for fluorescence excitation (in Hz)
+
         '''
-        Plot the histogram of the fluorescence lifetime values the analyzed image's pixels
-
-        : param phasors_calibrated: array with phasors in each pixel of the image extracted with calibrate_phasor function
-        : param method: method used for lifetime computation from the phasors
-        : param interval: range of lifetime values shown in the histogram
-        : param bin number: bins of the histogram
-        : dfd_freq: frequency of the pulsed laser source used for fluorescence excitation (in Hz)
-
-        '''
-
     if method == 'tau_phi':
         tau_phi = calculate_tau_phi(np.real(phasors_calibrated), np.imag(phasors_calibrated), dfd_freq=dfd_freq)
         tau_data = 1e9 * tau_phi.flatten()
