@@ -1,4 +1,5 @@
 from matplotlib import colors
+import numpy as np
 from matplotlib.pyplot import gca
 from matplotlib.colors import hsv_to_rgb
 from mpl_toolkits.axes_grid1 import make_axes_locatable
