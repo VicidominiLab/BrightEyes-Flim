@@ -4,6 +4,10 @@ from matplotlib.pyplot import gca
 from matplotlib.colors import hsv_to_rgb
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from scipy.ndimage import median_filter
+try:
+    from scipy import optimize as scipy_optimize
+except ImportError:  # pragma: no cover - optional dependency
+    scipy_optimize = None
 from tqdm.auto import tqdm
 import math
 from skimage.registration import phase_cross_correlation
@@ -12,6 +16,12 @@ import brighteyes_ism.analysis.Graph_lib as gra
 import h5py
 import matplotlib.pyplot as plt
 import os
+try:
+    import torch
+    from torch.fft import fftn, ifftn, ifftshift
+except ImportError:  # pragma: no cover - optional dependency
+    torch = None
+    fftn = ifftn = ifftshift = None
 
 import brighteyes_ism.dataio.mcs as mcs
 
@@ -212,6 +222,202 @@ class FlimData:
             return self.phasors_global_irf * coeff
 
 
+class Alignment:
+
+    @staticmethod
+    def _require_torch():
+        if torch is None or fftn is None or ifftn is None or ifftshift is None:
+            raise ImportError("torch is required for Alignment methods")
+
+    @staticmethod
+    def _require_scipy_optimize():
+        if scipy_optimize is None:
+            raise ImportError("scipy is required for Alignment fitting methods")
+
+    @staticmethod
+    def to_numpy_1d(x, dtype=None):
+        if torch is not None and torch.is_tensor(x):
+            x = x.detach().cpu().numpy()
+        x = np.asarray(x)
+        if dtype is not None:
+            x = x.astype(dtype, copy=False)
+        return x
+
+    @staticmethod
+    def to_torch_1d(x, dtype=None, device=None):
+        Alignment._require_torch()
+        if torch.is_tensor(x):
+            tensor = x.detach().clone()
+            if device is not None:
+                tensor = tensor.to(device)
+            if dtype is not None:
+                tensor = tensor.to(dtype=dtype)
+            return tensor
+        return torch.as_tensor(np.asarray(x), dtype=dtype, device=device)
+
+    @staticmethod
+    def model_data(t, C, tau, T):
+        offset = t[len(t) // 2]
+        x = t - offset
+
+        b = np.exp(-T / tau)
+        denom = 1.0 - b
+
+        model = np.empty_like(t, dtype=float)
+        mask = x >= 0
+        model[mask] = C * np.exp(-x[mask] / tau) / denom
+        model[~mask] = C * np.exp(-(x[~mask] + T) / tau) / denom
+        return model
+
+    @staticmethod
+    def rectangular_IRF(t, dt):
+        t = np.asarray(t)
+        offset = t[len(t) // 2]
+        return np.where((t >= offset - dt) & (t <= offset + dt), 1.0, 0.0)
+
+    @staticmethod
+    def pad_tensor(x: torch.Tensor, pad_left: int, pad_right: int, dim: int, mode: str = "reflect"):
+        Alignment._require_torch()
+        if pad_left == 0 and pad_right == 0:
+            return x
+
+        length = x.shape[dim]
+
+        if mode == "reflect":
+            left_idx = torch.arange(pad_left, 0, -1, device=x.device)
+            right_idx = torch.arange(length - 2, length - pad_right - 2, -1, device=x.device)
+        elif mode == "replicate":
+            left_idx = torch.zeros(pad_left, dtype=torch.long, device=x.device)
+            right_idx = torch.full((pad_right,), length - 1, dtype=torch.long, device=x.device)
+        elif mode == "constant":
+            pad_shape = list(x.shape)
+            pad_shape[dim] = pad_left + pad_right
+            constant_pad = torch.zeros(pad_shape, dtype=x.dtype, device=x.device)
+            return torch.cat(
+                [
+                    constant_pad.narrow(dim, 0, pad_left),
+                    x,
+                    constant_pad.narrow(dim, pad_left, pad_right),
+                ],
+                dim=dim,
+            )
+        else:
+            raise ValueError(f"Unsupported padding mode: {mode}")
+
+        pad_left_tensor = x.index_select(dim, left_idx)
+        pad_right_tensor = x.index_select(dim, right_idx)
+        return torch.cat([pad_left_tensor, x, pad_right_tensor], dim=dim)
+
+    @staticmethod
+    def median_filter(x: torch.Tensor, window_size=3, dims=None, mode="reflect"):
+        Alignment._require_torch()
+        if dims is None:
+            dims = list(range(x.ndim))
+
+        if isinstance(window_size, int):
+            window_size = [window_size] * len(dims)
+        elif len(window_size) != len(dims):
+            raise ValueError("window_size must be scalar or match len(dims)")
+
+        for w in window_size:
+            if w % 2 == 0:
+                raise ValueError(f"All window sizes must be odd, got {w}")
+
+        out = x
+        for d, w in zip(dims, window_size):
+            pad_left = (w - 1) // 2
+            pad_right = w // 2
+            out = Alignment.pad_tensor(out, pad_left, pad_right, d, mode=mode)
+            out = out.unfold(d, w, 1).median(dim=-1).values
+
+        return out
+
+    @staticmethod
+    def partial_convolution_fft(volume: torch.Tensor, kernel: torch.Tensor, dim1: str = 'ijk', dim2: str = 'jkl',
+                                axis: str = 'jk', fourier: tuple = (False, False)):
+        Alignment._require_torch()
+        dim3 = dim1 + dim2
+        dim3 = ''.join(sorted(set(dim3), key=dim3.index))
+
+        dims = [dim1, dim2, dim3]
+        axis_list = [[d.find(c) for c in axis] for d in dims]
+
+        volume_fft = fftn(volume, dim=axis_list[0]) if not fourier[0] else volume
+        kernel_fft = fftn(kernel, dim=axis_list[1]) if not fourier[1] else kernel
+
+        conv = torch.einsum(f'{dim1},{dim2}->{dim3}', volume_fft, kernel_fft)
+        conv = ifftn(conv, dim=axis_list[2])
+        conv = ifftshift(conv, dim=axis_list[2])
+        return torch.real(conv)
+
+    @staticmethod
+    def IRF_from_data_deconvolution(ref_data, t, C_R, tau_R, T, iterations=30, eps=1e-8, regularization=3):
+        Alignment._require_torch()
+        ref_data = Alignment.to_torch_1d(ref_data, dtype=torch.float32)
+        irf_est = torch.ones_like(ref_data)
+
+        kernel = Alignment.to_torch_1d(Alignment.model_data(t, C_R, tau_R, T))
+        kernel_t = kernel.clone().flip(0)
+
+        kernel = fftn(kernel, dim=0)
+        kernel_t = fftn(kernel_t, dim=0)
+
+        y = torch.clamp(ref_data, min=0)
+
+        for _ in range(iterations):
+            conv = Alignment.partial_convolution_fft(irf_est, kernel, dim1='t', dim2='t', axis='t', fourier=(0, 1))
+            conv = torch.clamp(conv, min=eps)
+            relative_blur = y / conv
+            correction = Alignment.partial_convolution_fft(
+                relative_blur, kernel_t, dim1='t', dim2='t', axis='t', fourier=(0, 1)
+            )
+            irf_est = irf_est * correction
+            irf_est = torch.clamp(irf_est, min=0)
+            if regularization > 1:
+                irf_est = Alignment.median_filter(irf_est, window_size=regularization, dims=[0], mode='replicate')
+
+        return irf_est
+
+    @staticmethod
+    def fit_model_data(t, C, dT, tau, irf, period):
+        pure_model = Alignment.model_data(t, C, tau, period)
+        irf_shifted = shift(Alignment.to_numpy_1d(irf), dT, order=1, mode='grid-wrap')
+        pure_model = Alignment.to_torch_1d(pure_model)
+        irf_shifted = Alignment.to_torch_1d(irf_shifted)
+        return Alignment.partial_convolution_fft(pure_model, irf_shifted, dim1='t', dim2='t', axis='t',
+                                                 fourier=(0, 0))
+
+    @staticmethod
+    def perform_fit_data(t, data, irf, period, p0=None):
+        Alignment._require_scipy_optimize()
+        nbin = len(t)
+        fit_lambda = lambda t, C, dT, tau: Alignment.fit_model_data(t, C, dT, tau, irf=irf, period=period)
+        initial_guess = [10, 0, 2] if p0 is None else p0
+
+        popt, conv = scipy_optimize.curve_fit(
+            fit_lambda,
+            t,
+            data,
+            p0=initial_guess,
+            bounds=([0, -nbin // 2, 0.5], [np.inf, nbin // 2, 10]),
+            maxfev=600000,
+        )
+
+        return {"C": popt[0], "dT": popt[1], "tau": popt[2]}, conv
+
+    @staticmethod
+    def phasor_delay_from_hist(hist, period_ns, harmonic=1):
+        hist = Alignment.to_numpy_1d(hist, dtype=float)
+        phasor_value = np.fft.fft(hist / hist.sum())[harmonic].conj()
+        phase_rad = np.mod(np.angle(phasor_value), 2 * np.pi)
+        delay_ns = phase_rad / (2 * np.pi) * period_ns
+        return phasor_value, phase_rad, delay_ns
+
+    @staticmethod
+    def hist_for_plot(hist):
+        return Alignment.to_numpy_1d(hist)
+
+
 # class FlimCalibrateData:
 #
 #     def __init__(self, data_path: str, calibration_path: str, freq_exc: float = 21e6):
@@ -280,6 +486,198 @@ def sum_adjacent_pixel(data, n=4):
             d = d + data[:, :, i::n, i::n, :, :]
         print("merged data.shape", data.shape)
         return d
+
+
+def _require_torch():
+    if torch is None:
+        raise ImportError(
+            "estimate_irf() requires PyTorch. Please install `torch` to use the IRF deconvolution utilities."
+        )
+
+
+def periodic_single_exponential_model(t, C, tau, T):
+    """
+    Periodic single-exponential decay centered on the middle bin.
+
+    Parameters
+    ----------
+    t : array-like
+        Time axis.
+    C : float
+        Decay amplitude.
+    tau : float
+        Lifetime in the same time units as ``t`` and ``T``.
+    T : float
+        Excitation period in the same time units as ``t``.
+    """
+
+    t = np.asarray(t, dtype=float)
+    offset = t[len(t) // 2]
+    return C * (np.heaviside(t - offset, 1) + 1 / (np.exp(T / tau) - 1)) * np.exp((-t + offset) / tau)
+
+
+def pad_tensor(x, pad_left: int, pad_right: int, dim: int, mode: str = "reflect"):
+    """
+    Pad a torch tensor along one dimension.
+    """
+
+    _require_torch()
+
+    if pad_left == 0 and pad_right == 0:
+        return x
+
+    length = x.shape[dim]
+
+    if mode == "reflect":
+        left_idx = torch.arange(pad_left, 0, -1, device=x.device)
+        right_idx = torch.arange(length - 2, length - pad_right - 2, -1, device=x.device)
+    elif mode == "replicate":
+        left_idx = torch.zeros(pad_left, dtype=torch.long, device=x.device)
+        right_idx = torch.full((pad_right,), length - 1, dtype=torch.long, device=x.device)
+    elif mode == "constant":
+        pad_shape = list(x.shape)
+        pad_shape[dim] = pad_left + pad_right
+        constant_pad = torch.zeros(pad_shape, dtype=x.dtype, device=x.device)
+        return torch.cat(
+            [
+                constant_pad.narrow(dim, 0, pad_left),
+                x,
+                constant_pad.narrow(dim, pad_left, pad_right),
+            ],
+            dim=dim,
+        )
+    else:
+        raise ValueError(f"Unsupported padding mode: {mode}")
+
+    pad_left_tensor = x.index_select(dim, left_idx)
+    pad_right_tensor = x.index_select(dim, right_idx)
+
+    return torch.cat([pad_left_tensor, x, pad_right_tensor], dim=dim)
+
+
+def torch_median_filter(x, window_size=3, dims=None, mode="reflect"):
+    """
+    Apply a median filter to a torch tensor along selected dimensions.
+    """
+
+    _require_torch()
+
+    if dims is None:
+        dims = list(range(x.ndim))
+
+    if isinstance(window_size, int):
+        window_size = [window_size] * len(dims)
+    elif len(window_size) != len(dims):
+        raise ValueError("window_size must be scalar or match len(dims)")
+
+    for w in window_size:
+        if w % 2 == 0:
+            raise ValueError(f"All window sizes must be odd, got {w}")
+
+    out = x
+    for d, w in zip(dims, window_size):
+        pad_left = (w - 1) // 2
+        pad_right = w // 2
+        out = pad_tensor(out, pad_left, pad_right, d, mode=mode)
+        out = out.unfold(d, w, 1).median(dim=-1).values
+
+    return out
+
+
+def partial_convolution_fft(volume, kernel, dim1: str = "ijk", dim2: str = "jkl",
+                            axis: str = "jk", fourier: tuple = (False, False)):
+    """
+    Convolution through FFT with einsum-based dimension bookkeeping.
+    """
+
+    _require_torch()
+
+    dim3 = dim1 + dim2
+    dim3 = ''.join(sorted(set(dim3), key=dim3.index))
+    dims = [dim1, dim2, dim3]
+    axis_list = [[d.find(c) for c in axis] for d in dims]
+
+    volume_fft = fftn(volume, dim=axis_list[0]) if not fourier[0] else volume
+    kernel_fft = fftn(kernel, dim=axis_list[1]) if not fourier[1] else kernel
+
+    conv = torch.einsum(f"{dim1},{dim2}->{dim3}", volume_fft, kernel_fft)
+    conv = ifftn(conv, dim=axis_list[2])
+    conv = ifftshift(conv, dim=axis_list[2])
+    conv = torch.real(conv)
+    return conv
+
+
+def richardson_lucy_deconvolution(ref_data, t, C_R, tau_R, T, iterations=30, eps=1e-8, regularization=3):
+    """
+    Estimate an IRF from a measured reference decay using Richardson-Lucy deconvolution.
+
+    Parameters
+    ----------
+    ref_data : torch.Tensor or array-like
+        Measured reference decay histogram.
+    t : array-like
+        Time axis.
+    C_R : float
+        Amplitude of the reference mono-exponential model.
+    tau_R : float
+        Lifetime of the reference sample in the same time units as ``t`` and ``T``.
+    T : float
+        Excitation period in the same time units as ``t``.
+    iterations : int, optional
+        Number of Richardson-Lucy iterations.
+    eps : float, optional
+        Numerical floor used to avoid divisions by zero.
+    regularization : int, optional
+        Odd median-filter window applied at each iteration. Set to ``1`` to disable.
+    """
+
+    _require_torch()
+
+    if not torch.is_tensor(ref_data):
+        ref_data = torch.as_tensor(ref_data)
+
+    ref_data = ref_data.to(dtype=torch.float32)
+    kernel = torch.as_tensor(
+        periodic_single_exponential_model(t, C_R, tau_R, T),
+        dtype=ref_data.dtype,
+        device=ref_data.device,
+    )
+    kernel_t = kernel.flip(0)
+
+    irf_est = torch.ones_like(ref_data)
+    kernel_fft = fftn(kernel, dim=0)
+    kernel_t_fft = fftn(kernel_t, dim=0)
+    y = torch.clamp(ref_data, min=0)
+
+    for _ in range(iterations):
+        conv = partial_convolution_fft(irf_est, kernel_fft, dim1="t", dim2="t", axis="t", fourier=(False, True))
+        conv = torch.clamp(conv, min=eps)
+        relative_blur = y / conv
+        correction = partial_convolution_fft(
+            relative_blur, kernel_t_fft, dim1="t", dim2="t", axis="t", fourier=(False, True)
+        )
+        irf_est = torch.clamp(irf_est * correction, min=0)
+        if regularization > 1:
+            irf_est = torch_median_filter(irf_est, window_size=regularization, dims=[0], mode="replicate")
+
+    return irf_est
+
+
+def estimate_irf(ref_data, t, C_R, tau, period, iterations=300, eps=1e-8, regularization=3):
+    """
+    Convenience wrapper around :func:`richardson_lucy_deconvolution`.
+    """
+
+    return richardson_lucy_deconvolution(
+        ref_data,
+        t,
+        C_R,
+        tau,
+        period,
+        iterations=iterations,
+        eps=eps,
+        regularization=regularization,
+    )
 
 
 def plot_universal_circle(ax=None):
@@ -1023,10 +1421,6 @@ def plot_flim_image(data_4D, phasors_calibrated, method='tau_phi', pxsize=0.04, 
         gra.show_flim(data_histograms, tau_m * 1e9, pxsize=pxsize, pxdwelltime=pxdwelltime,
                       lifetime_bounds=lifetime_bounds, fig=fig, ax=ax2)
         fig.tight_layout()
-
-
-
-
 
 
 
