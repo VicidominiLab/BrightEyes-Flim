@@ -256,7 +256,7 @@ class Alignment:
         return torch.as_tensor(np.asarray(x), dtype=dtype, device=device)
 
     @staticmethod
-    def model_data(t, C, tau, T):
+    def model_dataGGG(t, C, tau, T):
         offset = t[len(t) // 2]
         x = t - offset
 
@@ -269,11 +269,37 @@ class Alignment:
         model[~mask] = C * np.exp(-(x[~mask] + T) / tau) / denom
         return model
 
+    @staticmethod    
+    def model_data(t, C, tau, T):
+        """
+        Periodic mono-exponential decay model.
+
+        Units:
+        - ``t`` and ``T`` are in nanoseconds.
+        - ``tau`` is in nanoseconds.
+        - ``C`` is the model amplitude. When the fit helpers are used, it is a
+          normalized 0..1 scale factor.
+        """
+        t_ns = Alignment.to_numpy_1d(t, dtype=float)
+        C_norm = float(C)
+        tau_ns = float(tau)
+        period_ns = float(T)
+
+        offset_ns = t_ns[len(t_ns) // 2]
+        model_hist = C_norm * (
+            np.heaviside(t_ns - offset_ns, 1) + 1 / (np.exp(period_ns / tau_ns) - 1)
+        ) * np.exp((-t_ns + offset_ns) / tau_ns)
+
+        return model_hist
+
+
+
     @staticmethod
     def rectangular_IRF(t, dt):
-        t = np.asarray(t)
-        offset = t[len(t) // 2]
-        return np.where((t >= offset - dt) & (t <= offset + dt), 1.0, 0.0)
+        t_ns = Alignment.to_numpy_1d(t, dtype=float)
+        dt_ns = float(dt)
+        offset_ns = t_ns[len(t_ns) // 2]
+        return np.where((t_ns >= offset_ns - dt_ns) & (t_ns <= offset_ns + dt_ns), 1.0, 0.0)
 
     @staticmethod
     def pad_tensor(x: torch.Tensor, pad_left: int, pad_right: int, dim: int, mode: str = "reflect"):
@@ -352,17 +378,30 @@ class Alignment:
 
     @staticmethod
     def IRF_from_data_deconvolution(ref_data, t, C_R, tau_R, T, iterations=30, eps=1e-8, regularization=3):
-        Alignment._require_torch()
-        ref_data = Alignment.to_torch_1d(ref_data, dtype=torch.float32)
-        irf_est = torch.ones_like(ref_data)
+        """
+        Estimate the IRF from a reference histogram.
 
-        kernel = Alignment.to_torch_1d(Alignment.model_data(t, C_R, tau_R, T))
+        Units:
+        - ``t`` and ``T`` are in nanoseconds.
+        - ``tau_R`` is in nanoseconds.
+        - ``C_R`` is the reference-model amplitude.
+        """
+        Alignment._require_torch()
+        ref_hist = Alignment.to_torch_1d(ref_data, dtype=torch.float64)
+        t_ns = Alignment.to_numpy_1d(t, dtype=float)
+        C_ref = float(C_R)
+        tau_ref_ns = float(tau_R)
+        period_ns = float(T)
+
+        irf_est = torch.ones_like(ref_hist)
+
+        kernel = Alignment.to_torch_1d(Alignment.model_data(t_ns, C_ref, tau_ref_ns, period_ns))
         kernel_t = kernel.clone().flip(0)
 
         kernel = fftn(kernel, dim=0)
         kernel_t = fftn(kernel_t, dim=0)
 
-        y = torch.clamp(ref_data, min=0)
+        y = torch.clamp(ref_hist, min=0)
 
         for _ in range(iterations):
             conv = Alignment.partial_convolution_fft(irf_est, kernel, dim1='t', dim2='t', axis='t', fourier=(0, 1))
@@ -380,30 +419,131 @@ class Alignment:
 
     @staticmethod
     def fit_model_data(t, C, dT, tau, irf, period):
-        pure_model = Alignment.model_data(t, C, tau, period)
-        irf_shifted = shift(Alignment.to_numpy_1d(irf), dT, order=1, mode='grid-wrap')
-        pure_model = Alignment.to_torch_1d(pure_model)
-        irf_shifted = Alignment.to_torch_1d(irf_shifted)
-        return Alignment.partial_convolution_fft(pure_model, irf_shifted, dim1='t', dim2='t', axis='t',
-                                                 fourier=(0, 0))
+        """
+        Convolve the mono-exponential model with a shifted IRF.
+
+        Units:
+        - ``t`` and ``period`` are in nanoseconds.
+        - ``tau`` is in nanoseconds.
+        - ``dT`` is in histogram bins, because it is applied through
+          ``scipy.ndimage.shift(..., mode='grid-wrap')``.
+        """
+        t_ns = Alignment.to_numpy_1d(t, dtype=float)
+        irf_hist = Alignment.to_numpy_1d(irf, dtype=float)
+        C_norm = float(C)
+        dT_bins = float(dT)
+        tau_ns = float(tau)
+        period_ns = float(period)
+
+        pure_model_hist = Alignment.model_data(t_ns, C_norm, tau_ns, period_ns)
+        irf_shifted_hist = shift(irf_hist, dT_bins, order=1, mode='grid-wrap')
+        pure_model_hist = Alignment.to_torch_1d(pure_model_hist)
+        irf_shifted_hist = Alignment.to_torch_1d(irf_shifted_hist)
+        return Alignment.partial_convolution_fft(
+            pure_model_hist, irf_shifted_hist, dim1='t', dim2='t', axis='t', fourier=(0, 0)
+        )
 
     @staticmethod
-    def perform_fit_data(t, data, irf, period, p0=None):
+    def perform_fit_data(t, data, irf, period, initial_tau=None, initial_dT=None, initial_C=None):
+        """
+        Fit ``data`` with ``fit_model_data``.
+
+        Unit contract:
+        - ``t`` and ``period`` are in nanoseconds.
+        - ``tau`` / ``initial_tau`` are in nanoseconds.
+        - ``dT`` / ``initial_dT`` are in bins.
+        - returned ``C`` is a normalized 0..1 amplitude because the data is
+          normalized by its maximum and the IRF by its sum.
+        """
+        t_ns = Alignment.to_numpy_1d(t, dtype=float)
+        data_hist = Alignment.to_numpy_1d(data, dtype=float)
+        irf_hist = Alignment.to_numpy_1d(irf, dtype=float)
+
+        if len(t_ns) != len(data_hist) or len(t_ns) != len(irf_hist):
+            raise ValueError("t, data, and irf must have the same 1D length")
+
+        data_hist = data_hist / data_hist.max()
+        irf_hist = irf_hist / irf_hist.sum()
+
         Alignment._require_scipy_optimize()
-        nbin = len(t)
-        fit_lambda = lambda t, C, dT, tau: Alignment.fit_model_data(t, C, dT, tau, irf=irf, period=period)
-        initial_guess = [10, 0, 2] if p0 is None else p0
+        nbin = len(t_ns)
+        fit_lambda = lambda t_ns_fit, C_norm, dT_bins, tau_ns: Alignment.fit_model_data(
+            t_ns_fit, C_norm, dT_bins, tau_ns, irf=irf_hist, period=period
+        )
+
+        initial_guess = [1.0, 0.0, 1.0]
+
+        if initial_C is not None:
+            initial_guess[0] = initial_C
+        if initial_dT is not None:
+            initial_guess[1] = initial_dT   
+        if initial_tau is not None:
+            initial_guess[2] = initial_tau
 
         popt, conv = scipy_optimize.curve_fit(
             fit_lambda,
-            t,
-            data,
+            t_ns,
+            data_hist,
             p0=initial_guess,
-            bounds=([0, -nbin // 2, 0.5], [np.inf, nbin // 2, 10]),
+            bounds=([0.0, -nbin // 2, 1e-5], [np.inf, nbin // 2 + nbin % 2, t_ns.max()]),
             maxfev=600000,
         )
 
         return {"C": popt[0], "dT": popt[1], "tau": popt[2]}, conv
+
+    @staticmethod
+    def perform_fit_data_ng(t, data, irf, period, initial_tau=None, initial_dT=None, initial_C=None):
+        """
+        Same fit as ``perform_fit_data()``, but ``data`` and ``irf`` are rolled
+        so the data peak is near the central bin before fitting.
+
+        The returned ``dT`` is converted back to the original, unrolled bin
+        coordinates.
+        """
+        Alignment._require_scipy_optimize()
+
+        t_ns = Alignment.to_numpy_1d(t, dtype=float)
+        data_hist = Alignment.to_numpy_1d(data, dtype=float)
+        irf_hist = Alignment.to_numpy_1d(irf, dtype=float)
+
+        if len(t_ns) != len(data_hist) or len(t_ns) != len(irf_hist):
+            raise ValueError("t, data, and irf must have the same 1D length")
+
+        data_hist = data_hist / data_hist.max()
+        irf_hist = irf_hist / irf_hist.sum()
+
+        nbin = len(t_ns)
+        roll_to_center_bins = np.mod(nbin // 2 - int(np.argmax(data_hist)), nbin)
+
+        data_hist_rolled = np.roll(data_hist, roll_to_center_bins)
+        irf_hist_rolled = np.roll(irf_hist, roll_to_center_bins)
+
+        fit_lambda = lambda t_ns_fit, C_norm, dT_bins, tau_ns: Alignment.fit_model_data(
+            t_ns_fit, C_norm, dT_bins, tau_ns, irf=irf_hist_rolled, period=period
+        )
+
+        initial_guess = [1.0, 0.0, 1.0]
+
+        if initial_C is not None:
+            initial_guess[0] = initial_C
+        if initial_dT is not None:
+            initial_guess[1] = initial_dT + roll_to_center_bins
+        if initial_tau is not None:
+            initial_guess[2] = initial_tau
+
+        popt, conv = scipy_optimize.curve_fit(
+            fit_lambda,
+            t_ns,
+            data_hist_rolled,
+            p0=initial_guess,
+            bounds=([0.0, -nbin / 2, 1e-5], [np.inf, nbin / 2, t_ns.max()]),
+            maxfev=600000,
+        )
+
+        dT_bins = popt[1] - roll_to_center_bins
+        dT_bins = ((dT_bins + nbin / 2) % nbin) - nbin / 2
+
+        return {"C": popt[0], "dT": dT_bins, "tau": popt[2]}, conv
 
     @staticmethod
     def phasor_delay_from_hist(hist, period_ns, harmonic=1):
@@ -636,7 +776,7 @@ def richardson_lucy_deconvolution(ref_data, t, C_R, tau_R, T, iterations=30, eps
     if not torch.is_tensor(ref_data):
         ref_data = torch.as_tensor(ref_data)
 
-    ref_data = ref_data.to(dtype=torch.float32)
+    ref_data = ref_data.to(dtype=torch.float64)
     kernel = torch.as_tensor(
         periodic_single_exponential_model(t, C_R, tau_R, T),
         dtype=ref_data.dtype,
@@ -1421,7 +1561,5 @@ def plot_flim_image(data_4D, phasors_calibrated, method='tau_phi', pxsize=0.04, 
         gra.show_flim(data_histograms, tau_m * 1e9, pxsize=pxsize, pxdwelltime=pxdwelltime,
                       lifetime_bounds=lifetime_bounds, fig=fig, ax=ax2)
         fig.tight_layout()
-
-
 
 
