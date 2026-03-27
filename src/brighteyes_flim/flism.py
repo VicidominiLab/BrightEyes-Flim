@@ -287,15 +287,10 @@ class Alignment:
         period_ns = float(T)
         shift_ns = float(shift_bins * (period_ns / len(t_ns)))
 
-        offset_ns = period_ns/2
-        t_ns = np.mod(t_ns - shift_ns, period_ns)
-
-        # model_hist = C_norm * (
-        #     np.heaviside(t_ns - offset_ns, 1) + 1 / (np.exp(period_ns / tau_ns) - 1)
-        # ) * np.exp((-t_ns + offset_ns) / tau_ns)
+        t_local_ns = t_ns - shift_ns - T - (period_ns / 2)
 
         model_hist =  C_norm * (
-            np.exp(-(np.mod(t_ns - offset_ns, period_ns)) / tau_ns)
+            np.exp(-(np.mod(t_local_ns, period_ns)) / tau_ns)
             / (1 - np.exp(-period_ns / tau_ns))
         )
     
