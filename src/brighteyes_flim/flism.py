@@ -255,22 +255,22 @@ class Alignment:
             return tensor
         return torch.as_tensor(np.asarray(x), dtype=dtype, device=device)
 
-    @staticmethod
-    def model_dataGGG(t, C, tau, T):
-        offset = t[len(t) // 2]
-        x = t - offset
+    # @staticmethod
+    # def model_dataGGG(t, C, tau, T):
+    #     offset = t[len(t) // 2]
+    #     x = t - offset
 
-        b = np.exp(-T / tau)
-        denom = 1.0 - b
+    #     b = np.exp(-T / tau)
+    #     denom = 1.0 - b
 
-        model = np.empty_like(t, dtype=float)
-        mask = x >= 0
-        model[mask] = C * np.exp(-x[mask] / tau) / denom
-        model[~mask] = C * np.exp(-(x[~mask] + T) / tau) / denom
-        return model
+    #     model = np.empty_like(t, dtype=float)
+    #     mask = x >= 0
+    #     model[mask] = C * np.exp(-x[mask] / tau) / denom
+    #     model[~mask] = C * np.exp(-(x[~mask] + T) / tau) / denom
+    #     return model
 
     @staticmethod    
-    def model_data(t, C, tau, T):
+    def model_data(t, C, tau, T, shift_bins=0.):
         """
         Periodic mono-exponential decay model.
 
@@ -278,18 +278,27 @@ class Alignment:
         - ``t`` and ``T`` are in nanoseconds.
         - ``tau`` is in nanoseconds.
         - ``C`` is the model amplitude. When the fit helpers are used, it is a
+        - ``shift_bins`` is in histogram bins, because it is applied through
           normalized 0..1 scale factor.
         """
         t_ns = Alignment.to_numpy_1d(t, dtype=float)
         C_norm = float(C)
         tau_ns = float(tau)
         period_ns = float(T)
+        shift_ns = float(shift_bins * (period_ns / len(t_ns)))
 
-        offset_ns = t_ns[len(t_ns) // 2]
-        model_hist = C_norm * (
-            np.heaviside(t_ns - offset_ns, 1) + 1 / (np.exp(period_ns / tau_ns) - 1)
-        ) * np.exp((-t_ns + offset_ns) / tau_ns)
+        offset_ns = np.mod(T / 2, period_ns)    
+        t_ns = np.mod(t_ns - shift_ns, period_ns)
 
+        # model_hist = C_norm * (
+        #     np.heaviside(t_ns - offset_ns, 1) + 1 / (np.exp(period_ns / tau_ns) - 1)
+        # ) * np.exp((-t_ns + offset_ns) / tau_ns)
+
+        model_hist =  C_norm * (
+            np.exp(-(np.mod(t_ns - offset_ns, period_ns)) / tau_ns)
+            / (1 - np.exp(-period_ns / tau_ns))
+        )
+    
         return model_hist
 
 
@@ -298,7 +307,7 @@ class Alignment:
     def rectangular_IRF(t, dt):
         t_ns = Alignment.to_numpy_1d(t, dtype=float)
         dt_ns = float(dt)
-        offset_ns = t_ns[len(t_ns) // 2]
+        offset_ns = (t_ns.max() - t_ns.min()) / 2
         return np.where((t_ns >= offset_ns - dt_ns) & (t_ns <= offset_ns + dt_ns), 1.0, 0.0)
 
     @staticmethod
@@ -418,6 +427,15 @@ class Alignment:
         return irf_est
 
     @staticmethod
+    def linear_shift(data, shift_value, cyclic=True):
+        xp = np.arange(0, data.shape[0])
+        fp = data.copy()
+        x = np.arange(0, data.shape[0]) - shift_value
+        if cyclic:
+            x = np.mod(x, data.shape[0])
+        return np.interp(x, xp, fp)
+
+    @staticmethod
     def fit_model_data(t, C, dT, tau, irf, period):
         """
         Convolve the mono-exponential model with a shifted IRF.
@@ -431,12 +449,20 @@ class Alignment:
         t_ns = Alignment.to_numpy_1d(t, dtype=float)
         irf_hist = Alignment.to_numpy_1d(irf, dtype=float)
         C_norm = float(C)
-        dT_bins = float(dT)
+        dT_bins = float(dT) 
         tau_ns = float(tau)
         period_ns = float(period)
 
-        pure_model_hist = Alignment.model_data(t_ns, C_norm, tau_ns, period_ns)
-        irf_shifted_hist = shift(irf_hist, dT_bins, order=1, mode='grid-wrap')
+        pure_model_hist = Alignment.model_data(t_ns, C_norm, tau_ns, period_ns, shift_bins=dT_bins)
+        pure_model_hist = pure_model_hist / pure_model_hist.sum()  # normalize model to unit area so C is a simple amplitude factor
+        #pure_model_hist = np.log(pure_model_hist + 1)  # add small constant to avoid log(0)
+
+        #irf_shifted_hist = shift(irf_hist, dT_bins, order=1, mode='grid-wrap')
+        irf_shifted_hist = irf_hist
+        #irf_shifted_hist = Alignment.linear_shift(irf_hist, shift_value=dT_bins, cyclic=True)
+    
+
+
         pure_model_hist = Alignment.to_torch_1d(pure_model_hist)
         irf_shifted_hist = Alignment.to_torch_1d(irf_shifted_hist)
         return Alignment.partial_convolution_fft(
@@ -464,6 +490,8 @@ class Alignment:
 
         data_hist = data_hist / data_hist.max()
         irf_hist = irf_hist / irf_hist.sum()
+        #data_hist = np.log(data_hist + 1)  # add small constant to avoid log(0)
+        irf_hist = np.log(irf_hist + 1)  # add small constant to avoid log(0)    
 
         Alignment._require_scipy_optimize()
         nbin = len(t_ns)
@@ -476,7 +504,7 @@ class Alignment:
         if initial_C is not None:
             initial_guess[0] = initial_C
         if initial_dT is not None:
-            initial_guess[1] = initial_dT   
+            initial_guess[1] = initial_dT
         if initial_tau is not None:
             initial_guess[2] = initial_tau
 
@@ -485,65 +513,66 @@ class Alignment:
             t_ns,
             data_hist,
             p0=initial_guess,
-            bounds=([0.0, -nbin // 2, 1e-5], [np.inf, nbin // 2 + nbin % 2, t_ns.max()]),
+#            bounds=([0.0, -nbin // 2, 1e-5], [np.inf, nbin // 2 + nbin % 2, t_ns.max()]),
+            bounds=([0.0, -nbin / 2, 1e-5], [np.inf, nbin / 2, t_ns.max()]),
             maxfev=600000,
         )
 
         return {"C": popt[0], "dT": popt[1], "tau": popt[2]}, conv
 
-    @staticmethod
-    def perform_fit_data_ng(t, data, irf, period, initial_tau=None, initial_dT=None, initial_C=None):
-        """
-        Same fit as ``perform_fit_data()``, but ``data`` and ``irf`` are rolled
-        so the data peak is near the central bin before fitting.
+    # @staticmethod
+    # def perform_fit_data_ng(t, data, irf, period, initial_tau=None, initial_dT=None, initial_C=None):
+    #     """
+    #     Same fit as ``perform_fit_data()``, but ``data`` and ``irf`` are rolled
+    #     so the data peak is near the central bin before fitting.
 
-        The returned ``dT`` is converted back to the original, unrolled bin
-        coordinates.
-        """
-        Alignment._require_scipy_optimize()
+    #     The returned ``dT`` is converted back to the original, unrolled bin
+    #     coordinates.
+    #     """
+    #     Alignment._require_scipy_optimize()
 
-        t_ns = Alignment.to_numpy_1d(t, dtype=float)
-        data_hist = Alignment.to_numpy_1d(data, dtype=float)
-        irf_hist = Alignment.to_numpy_1d(irf, dtype=float)
+    #     t_ns = Alignment.to_numpy_1d(t, dtype=float)
+    #     data_hist = Alignment.to_numpy_1d(data, dtype=float)
+    #     irf_hist = Alignment.to_numpy_1d(irf, dtype=float)
 
-        if len(t_ns) != len(data_hist) or len(t_ns) != len(irf_hist):
-            raise ValueError("t, data, and irf must have the same 1D length")
+    #     if len(t_ns) != len(data_hist) or len(t_ns) != len(irf_hist):
+    #         raise ValueError("t, data, and irf must have the same 1D length")
 
-        data_hist = data_hist / data_hist.max()
-        irf_hist = irf_hist / irf_hist.sum()
+    #     data_hist = data_hist / data_hist.max()
+    #     irf_hist = irf_hist / irf_hist.sum()
 
-        nbin = len(t_ns)
-        roll_to_center_bins = np.mod(nbin // 2 - int(np.argmax(data_hist)), nbin)
+    #     nbin = len(t_ns)
+    #     roll_to_center_bins = np.mod(nbin // 2 - int(np.argmax(data_hist)), nbin)
 
-        data_hist_rolled = np.roll(data_hist, roll_to_center_bins)
-        irf_hist_rolled = np.roll(irf_hist, roll_to_center_bins)
+    #     data_hist_rolled = np.roll(data_hist, roll_to_center_bins)
+    #     irf_hist_rolled = np.roll(irf_hist, roll_to_center_bins)
 
-        fit_lambda = lambda t_ns_fit, C_norm, dT_bins, tau_ns: Alignment.fit_model_data(
-            t_ns_fit, C_norm, dT_bins, tau_ns, irf=irf_hist_rolled, period=period
-        )
+    #     fit_lambda = lambda t_ns_fit, C_norm, dT_bins, tau_ns: Alignment.fit_model_data(
+    #         t_ns_fit, C_norm, dT_bins, tau_ns, irf=irf_hist_rolled, period=period
+    #     )
 
-        initial_guess = [1.0, 0.0, 1.0]
+    #     initial_guess = [1.0, 0.0, 1.0]
 
-        if initial_C is not None:
-            initial_guess[0] = initial_C
-        if initial_dT is not None:
-            initial_guess[1] = initial_dT + roll_to_center_bins
-        if initial_tau is not None:
-            initial_guess[2] = initial_tau
+    #     if initial_C is not None:
+    #         initial_guess[0] = initial_C
+    #     if initial_dT is not None:
+    #         initial_guess[1] = initial_dT + roll_to_center_bins
+    #     if initial_tau is not None:
+    #         initial_guess[2] = initial_tau
 
-        popt, conv = scipy_optimize.curve_fit(
-            fit_lambda,
-            t_ns,
-            data_hist_rolled,
-            p0=initial_guess,
-            bounds=([0.0, -nbin / 2, 1e-5], [np.inf, nbin / 2, t_ns.max()]),
-            maxfev=600000,
-        )
+    #     popt, conv = scipy_optimize.curve_fit(
+    #         fit_lambda,
+    #         t_ns,
+    #         data_hist_rolled,
+    #         p0=initial_guess,
+    #         bounds=([0.0, -nbin / 2, 1e-5], [np.inf, nbin / 2, t_ns.max()]),
+    #         maxfev=600000,
+    #     )
 
-        dT_bins = popt[1] - roll_to_center_bins
-        dT_bins = ((dT_bins + nbin / 2) % nbin) - nbin / 2
+    #     dT_bins = popt[1] - roll_to_center_bins
+    #     dT_bins = ((dT_bins + nbin / 2) % nbin) - nbin / 2
 
-        return {"C": popt[0], "dT": dT_bins, "tau": popt[2]}, conv
+    #     return {"C": popt[0], "dT": dT_bins, "tau": popt[2]}, conv
 
     @staticmethod
     def phasor_delay_from_hist(hist, period_ns, harmonic=1):
@@ -652,7 +681,7 @@ def periodic_single_exponential_model(t, C, tau, T):
     """
 
     t = np.asarray(t, dtype=float)
-    offset = t[len(t) // 2]
+    offset = (t.max() - t.min()) / 2
     return C * (np.heaviside(t - offset, 1) + 1 / (np.exp(T / tau) - 1)) * np.exp((-t + offset) / tau)
 
 
