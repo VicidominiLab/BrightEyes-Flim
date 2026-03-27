@@ -287,7 +287,7 @@ class Alignment:
         period_ns = float(T)
         shift_ns = float(shift_bins * (period_ns / len(t_ns)))
 
-        offset_ns = np.mod(T / 2, period_ns)    
+        offset_ns = period_ns/2
         t_ns = np.mod(t_ns - shift_ns, period_ns)
 
         # model_hist = C_norm * (
@@ -436,7 +436,7 @@ class Alignment:
         return np.interp(x, xp, fp)
 
     @staticmethod
-    def fit_model_data(t, C, dT, tau, irf, period):
+    def fit_model_data(t, C, dT, tau, irf, period, mode="irf_shift"):
         """
         Convolve the mono-exponential model with a shifted IRF.
 
@@ -453,14 +453,18 @@ class Alignment:
         tau_ns = float(tau)
         period_ns = float(period)
 
-        pure_model_hist = Alignment.model_data(t_ns, C_norm, tau_ns, period_ns, shift_bins=dT_bins)
+        if mode=="model_shift":
+            pure_model_hist = Alignment.model_data(t_ns, C_norm, tau_ns, period_ns, shift_bins=dT_bins)
+            irf_shifted_hist = irf_hist   
+        elif mode=="irf_shift":
+            pure_model_hist = Alignment.model_data(t_ns, C_norm, tau_ns, period_ns)
+            irf_shifted_hist = shift(irf_hist, dT_bins, order=1, mode='grid-wrap') #use scipy.ndimage.shift for sub-bin shifts with cyclic wrapping, using linear interpolation
+            #irf_shifted_hist = Alignment.linear_shift(irf_hist, shift_value=dT_bins, cyclic=True) # use linear interpolation for sub-bin shifts, with cyclic wrapping
+        else:
+            raise ValueError(f"Unsupported mode: {mode}. Supported model_shift, irf_shift")
+        
         pure_model_hist = pure_model_hist / pure_model_hist.sum()  # normalize model to unit area so C is a simple amplitude factor
-        #pure_model_hist = np.log(pure_model_hist + 1)  # add small constant to avoid log(0)
-
-        #irf_shifted_hist = shift(irf_hist, dT_bins, order=1, mode='grid-wrap')
-        irf_shifted_hist = irf_hist
-        #irf_shifted_hist = Alignment.linear_shift(irf_hist, shift_value=dT_bins, cyclic=True)
-    
+        irf_shifted_hist = irf_shifted_hist / irf_shifted_hist.sum()  # normalize IRF to unit area  
 
 
         pure_model_hist = Alignment.to_torch_1d(pure_model_hist)
@@ -470,7 +474,7 @@ class Alignment:
         )
 
     @staticmethod
-    def perform_fit_data(t, data, irf, period, initial_tau=None, initial_dT=None, initial_C=None):
+    def perform_fit_data(t, data, irf, period, initial_tau=None, initial_dT=None, initial_C=None, mode="irf_shift"):
         """
         Fit ``data`` with ``fit_model_data``.
 
@@ -491,12 +495,12 @@ class Alignment:
         data_hist = data_hist / data_hist.max()
         irf_hist = irf_hist / irf_hist.sum()
         #data_hist = np.log(data_hist + 1)  # add small constant to avoid log(0)
-        irf_hist = np.log(irf_hist + 1)  # add small constant to avoid log(0)    
-
+        #irf_hist = np.log(irf_hist + 1)  # add small constant to avoid log(0)    
+        
         Alignment._require_scipy_optimize()
         nbin = len(t_ns)
         fit_lambda = lambda t_ns_fit, C_norm, dT_bins, tau_ns: Alignment.fit_model_data(
-            t_ns_fit, C_norm, dT_bins, tau_ns, irf=irf_hist, period=period
+            t_ns_fit, C_norm, dT_bins, tau_ns, irf=irf_hist, period=period, mode=mode
         )
 
         initial_guess = [1.0, 0.0, 1.0]
