@@ -20,8 +20,9 @@ __all__ = [
     "hist_for_plot",
     "mcs",
     "model_data",
-    "perform_fit_data",
+    "perform_fit_data",    
     #"perform_fit_data_ng",
     "phasor_delay_from_hist",
+    "phasor_delay_from_hist_in_units",
     "rectangular_IRF",
 ]

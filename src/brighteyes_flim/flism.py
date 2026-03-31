@@ -716,6 +716,32 @@ class Alignment:
         )
 
     @staticmethod
+    def estimate_peak_dT_bins(data, irf):
+        """
+        Estimate a direct circular shift seed from the data/IRF peak locations.
+
+        The returned shift is wrapped to the public ``[-nbin/2, nbin/2)`` bin
+        convention used by the fitting helpers.
+        """
+        data_hist = Alignment.to_numpy_1d(data, dtype=float)
+        irf_hist = Alignment.to_numpy_1d(irf, dtype=float)
+
+        if len(data_hist) != len(irf_hist):
+            raise ValueError("data and irf must have the same 1D length")
+
+        nbin = len(data_hist)
+        data_peak_bin = int(np.argmax(data_hist))
+        irf_peak_bin = int(np.argmax(irf_hist))
+
+        return float(
+            Alignment._wrap_to_period(
+                data_peak_bin - irf_peak_bin,
+                period=float(nbin),
+                center=0.0,
+            )
+        )
+
+    @staticmethod
     def perform_fit_data(
         t,
         data,
@@ -739,6 +765,12 @@ class Alignment:
         - ``fit_type`` can be ``"circular"`` or ``"curve_fit"``.
         - ``force_C_normalized=True`` keeps ``C`` fixed to ``1.0`` and only
           fits ``dT`` and ``tau``.
+        - when ``initial_dT is None``, the fitter first pre-shifts the IRF by a
+          direct peak-based seed and then fits only the residual shift around
+          zero. This avoids the circular-boundary trap near ``+-nbin/2`` while
+          keeping the public returned ``dT`` in the same convention.
+        - when ``initial_dT`` is provided, it is used directly as the initial
+          guess for the public ``dT`` parameter.
         - returned ``C`` is a normalized 0..1 amplitude because the data is
           normalized by its sum and the IRF by its sum.
         """
@@ -768,12 +800,25 @@ class Alignment:
         
         Alignment._require_scipy_optimize()
         nbin = len(t_ns)
+        dT_seed_bins = None
+        fit_irf_hist_norm = irf_hist_norm
+        fit_initial_dT = initial_dT
+
+        if initial_dT is None:
+            dT_seed_bins = Alignment.estimate_peak_dT_bins(data_hist_norm, irf_hist_norm)
+            fit_irf_hist_norm = np.asarray(
+                shift(irf_hist_norm, dT_seed_bins, order=1, mode="grid-wrap"),
+                dtype=float,
+            )
+            fit_irf_hist_norm = fit_irf_hist_norm / fit_irf_hist_norm.sum()
+            fit_initial_dT = 0.0
+
         fit_lambda = lambda t_ns_fit, C_norm, dT_bins, tau_ns: Alignment.fit_model_data(
             t_ns_fit,
             C_norm,
-            -dT_bins,
+            dT_bins,
             tau_ns,
-            irf=irf_hist_norm,
+            irf=fit_irf_hist_norm,
             period=period,
             mode=mode,
         )
@@ -787,8 +832,8 @@ class Alignment:
 
         if initial_C is not None:
             initial_guess[0] = initial_C
-        if initial_dT is not None:
-            initial_guess[1] = initial_dT
+        if fit_initial_dT is not None:
+            initial_guess[1] = fit_initial_dT
         if initial_tau is not None:
             initial_guess[2] = initial_tau
 
@@ -819,6 +864,7 @@ class Alignment:
                     p0=initial_guess_fixed_c,
                     bounds=fit_bounds_fixed_c,
                     circular_params={0: float(nbin)},
+                    circular_curve_period=float(nbin),
                     maxfev=600000,
                 )
             elif fit_type == "curve_fit":
@@ -873,6 +919,16 @@ class Alignment:
                 )
             else:
                 raise ValueError(f"Unsupported fit_type: {fit_type}. Supported circular, curve_fit")
+
+        if dT_seed_bins is not None:
+            popt = np.asarray(popt, dtype=float).copy()
+            popt[1] = float(
+                Alignment._wrap_to_period(
+                    dT_seed_bins + popt[1],
+                    period=float(nbin),
+                    center=0.0,
+                )
+            )
 
         return {"C": popt[0], "dT": popt[1], "tau": popt[2]}, conv
 
@@ -1946,5 +2002,3 @@ def plot_flim_image(data_4D, phasors_calibrated, method='tau_phi', pxsize=0.04, 
         gra.show_flim(data_histograms, tau_m * 1e9, pxsize=pxsize, pxdwelltime=pxdwelltime,
                       lifetime_bounds=lifetime_bounds, fig=fig, ax=ax2)
         fig.tight_layout()
-
-
