@@ -1946,3 +1946,5 @@ def plot_flim_image(data_4D, phasors_calibrated, method='tau_phi', pxsize=0.04, 
         gra.show_flim(data_histograms, tau_m * 1e9, pxsize=pxsize, pxdwelltime=pxdwelltime,
                       lifetime_bounds=lifetime_bounds, fig=fig, ax=ax2)
         fig.tight_layout()
+
+
