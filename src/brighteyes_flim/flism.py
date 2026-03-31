@@ -255,6 +255,185 @@ class Alignment:
             return tensor
         return torch.as_tensor(np.asarray(x), dtype=dtype, device=device)
 
+    @staticmethod
+    def _wrap_to_period(x, period, center=0.0):
+        period = float(period)
+        center = float(center)
+        return center + np.mod(np.asarray(x) - center + 0.5 * period, period) - 0.5 * period
+
+    @staticmethod
+    def _normalize_circular_params(circular_params, n_params, lb, ub, p0):
+        if circular_params is None:
+            return {}
+
+        if isinstance(circular_params, dict):
+            circular_items = circular_params.items()
+        else:
+            circular_items = circular_params
+
+        normalized = {}
+        for item in circular_items:
+            if isinstance(item, tuple) and len(item) == 2:
+                idx, period = item
+            else:
+                idx, period = item, None
+
+            idx = int(idx)
+            if idx < 0 or idx >= n_params:
+                raise IndexError(f"circular parameter index out of range: {idx}")
+
+            if period is None:
+                if np.isfinite(lb[idx]) and np.isfinite(ub[idx]):
+                    period = ub[idx] - lb[idx]
+                else:
+                    raise ValueError(
+                        f"missing circular period for parameter {idx}; provide it explicitly "
+                        "or use finite bounds so it can be inferred"
+                    )
+
+            if float(period) <= 0:
+                raise ValueError(f"circular period must be positive for parameter {idx}")
+
+            if np.isfinite(lb[idx]) and np.isfinite(ub[idx]):
+                center = 0.5 * (lb[idx] + ub[idx])
+            else:
+                center = float(p0[idx])
+
+            normalized[idx] = {"period": float(period), "center": float(center)}
+
+        return normalized
+
+    @staticmethod
+    def curve_fit_circular(
+        f,
+        xdata,
+        ydata,
+        p0=None,
+        sigma=None,
+        absolute_sigma=False,
+        bounds=(-np.inf, np.inf),
+        circular_curve_period=None,
+        circular_curve_center=0.0,
+        circular_params=None,
+        maxfev=None,
+        method="trf",
+        **kwargs,
+    ):
+        """
+        ``curve_fit``-like helper aware of circular data and circular parameters.
+
+        Parameters
+        ----------
+        f : callable
+            Model function ``f(xdata, *params)``.
+        xdata, ydata : array-like
+            Input coordinates and observations.
+        p0, sigma, absolute_sigma, bounds, maxfev :
+            Same meaning as in ``scipy.optimize.curve_fit``.
+        circular_curve_period : float, optional
+            If provided, residuals are wrapped onto a circle with this period.
+        circular_curve_center : float, default 0.0
+            Center of the wrapped residual interval.
+        circular_params : dict or iterable, optional
+            Circular parameters. A dict maps ``param_index -> period``. If an
+            iterable is used, each item can be either ``index`` or
+            ``(index, period)``. When only the index is given, the period is
+            inferred from finite bounds.
+
+        Returns
+        -------
+        popt, pcov : ndarray
+            Best-fit parameters and covariance, like ``curve_fit``.
+        """
+        Alignment._require_scipy_optimize()
+
+        xdata = np.asarray(xdata)
+        ydata = Alignment.to_numpy_1d(ydata, dtype=float)
+
+        if p0 is None:
+            raise ValueError("curve_fit_circular requires an explicit p0")
+        p0 = Alignment.to_numpy_1d(p0, dtype=float)
+
+        n_params = len(p0)
+
+        lb, ub = bounds
+        lb = np.broadcast_to(np.asarray(lb, dtype=float), (n_params,)).copy()
+        ub = np.broadcast_to(np.asarray(ub, dtype=float), (n_params,)).copy()
+
+        circular_params = Alignment._normalize_circular_params(circular_params, n_params, lb, ub, p0)
+
+        if sigma is None:
+            sigma_array = None
+        else:
+            sigma_array = np.asarray(sigma, dtype=float)
+
+        def wrap_params(params):
+            params_wrapped = np.asarray(params, dtype=float).copy()
+            for idx, spec in circular_params.items():
+                params_wrapped[idx] = Alignment._wrap_to_period(
+                    params_wrapped[idx],
+                    period=spec["period"],
+                    center=spec["center"],
+                )
+            return params_wrapped
+
+        def residuals(params):
+            params_eval = wrap_params(params)
+            y_model = Alignment.to_numpy_1d(f(xdata, *params_eval), dtype=float)
+            resid = y_model - ydata
+            if circular_curve_period is not None:
+                resid = Alignment._wrap_to_period(
+                    resid,
+                    period=circular_curve_period,
+                    center=circular_curve_center,
+                )
+            if sigma_array is not None:
+                resid = resid / sigma_array
+            return resid
+
+        p0_internal = p0.copy()
+        for idx, spec in circular_params.items():
+            p0_internal[idx] = Alignment._wrap_to_period(
+                p0_internal[idx],
+                period=spec["period"],
+                center=spec["center"],
+            )
+
+        for idx in range(n_params):
+            if np.isfinite(lb[idx]) and p0_internal[idx] < lb[idx]:
+                p0_internal[idx] = lb[idx]
+            if np.isfinite(ub[idx]) and p0_internal[idx] > ub[idx]:
+                p0_internal[idx] = ub[idx]
+
+        max_nfev = maxfev if maxfev is not None else kwargs.pop("max_nfev", None)
+        result = scipy_optimize.least_squares(
+            residuals,
+            p0_internal,
+            bounds=(lb, ub),
+            method=method,
+            max_nfev=max_nfev,
+            **kwargs,
+        )
+
+        if not result.success:
+            raise RuntimeError(f"circular curve fit failed: {result.message}")
+
+        popt = wrap_params(result.x)
+
+        _, s, vt = np.linalg.svd(result.jac, full_matrices=False)
+        threshold = np.finfo(float).eps * max(result.jac.shape) * s[0] if s.size else 0.0
+        s = s[s > threshold]
+        vt = vt[: s.size]
+        pcov = np.dot(vt.T / (s ** 2), vt) if s.size else np.full((n_params, n_params), np.inf)
+
+        if not absolute_sigma and sigma_array is not None:
+            dof = max(0, len(ydata) - n_params)
+            if dof > 0:
+                cost = 2.0 * result.cost
+                pcov *= cost / dof
+
+        return popt, pcov
+
     # @staticmethod
     # def model_dataGGG(t, C, tau, T):
     #     offset = t[len(t) // 2]
@@ -270,30 +449,95 @@ class Alignment:
     #     return model
 
     @staticmethod    
-    def model_data(t, C, tau, T, shift_bins=0.):
+    def model_data(
+        t: np.ndarray,
+        C: float,
+        tau: float,
+        period: float,
+        shift_bins: float = 0.,
+        mode: str = ""
+        "binned",
+    ) -> np.ndarray:
         """
         Periodic mono-exponential decay model.
 
         Units:
-        - ``t`` and ``T`` are in nanoseconds.
+        - ``t`` and ``period`` are in nanoseconds.
         - ``tau`` is in nanoseconds.
         - ``C`` is the model amplitude. When the fit helpers are used, it is a
         - ``shift_bins`` is in histogram bins, because it is applied through
           normalized 0..1 scale factor.
+        - ``mode`` can be ``"sampled"`` for the current center-sampled model or
+          ``"binned"`` to integrate the model over each histogram bin.
         """
         t_ns = Alignment.to_numpy_1d(t, dtype=float)
         C_norm = float(C)
         tau_ns = float(tau)
-        period_ns = float(T)
+        period_ns = float(period)
+        mode = str(mode).lower()
         shift_ns = float(shift_bins * (period_ns / len(t_ns)))
 
-        t_local_ns = t_ns - shift_ns - T - (period_ns / 2)
+        t_local_ns = t_ns - shift_ns - period - (period_ns / 2)
+        '''
+        This shifts the time axis so the model is centered on the middle bin,
+        then applies the shift_bins as a sub-bin shift, and finally shifts back
+        by one period to ensure the model is zero at the start of the histogram.
+        '''
 
-        model_hist =  C_norm * (
-            np.exp(-(np.mod(t_local_ns, period_ns)) / tau_ns)
-            / (1 - np.exp(-period_ns / tau_ns))
-        )
-    
+        if mode == "binned":
+            if len(t_ns) < 2:
+                raise ValueError("mode='binned' requires at least two time samples")
+
+            dt_ns = float(t_ns[1] - t_ns[0])
+            if not np.allclose(np.diff(t_ns), dt_ns):
+                raise ValueError("mode='binned' requires uniformly spaced t values")
+
+            t_start_ns = t_local_ns - 0.5 * dt_ns
+            t_end_ns = t_start_ns + dt_ns
+            u0_ns = np.mod(t_start_ns, period_ns)
+            u1_ns = u0_ns + dt_ns
+            denom = 1 - np.exp(-period_ns / tau_ns)
+
+            model_hist = np.empty_like(t_ns, dtype=float)
+            same_period = u1_ns <= period_ns
+
+            model_hist[same_period] = (
+                tau_ns
+                * (
+                    np.exp(-u0_ns[same_period] / tau_ns)
+                    - np.exp(-u1_ns[same_period] / tau_ns)
+                )
+                / denom
+            )
+
+            if np.any(~same_period):
+                wrapped_u1_ns = u1_ns[~same_period] - period_ns
+                first_leg = (
+                    tau_ns
+                    * (
+                        np.exp(-u0_ns[~same_period] / tau_ns)
+                        - np.exp(-period_ns / tau_ns)
+                    )
+                    / denom
+                )
+                second_leg = (
+                    tau_ns
+                    * (
+                        1.0 - np.exp(-wrapped_u1_ns / tau_ns)
+                    )
+                    / denom
+                )
+                model_hist[~same_period] = first_leg + second_leg
+        elif mode == "sampled":
+            model_hist = (
+                np.exp(-(np.mod(t_local_ns, period_ns)) / tau_ns)
+                / (1 - np.exp(-period_ns / tau_ns))
+            )
+        else:
+            raise ValueError(f"Unsupported model_data mode: {mode}. Supported sampled, binned")
+
+        model_hist = C_norm * model_hist / model_hist.sum()  # normalize to unit area so C is a simple amplitude factor
+
         return model_hist
 
 
@@ -381,25 +625,27 @@ class Alignment:
         return torch.real(conv)
 
     @staticmethod
-    def IRF_from_data_deconvolution(ref_data, t, C_R, tau_R, T, iterations=30, eps=1e-8, regularization=3):
+    def IRF_from_data_deconvolution(ref_data, t, C_R, tau_R, period, iterations=30, eps=1e-8, regularization=3):
         """
         Estimate the IRF from a reference histogram.
 
         Units:
-        - ``t`` and ``T`` are in nanoseconds.
+        - ``t`` and ``period`` are in nanoseconds.
         - ``tau_R`` is in nanoseconds.
         - ``C_R`` is the reference-model amplitude.
+        - ``period`` is the excitation period in the same time units as ``t``.
         """
         Alignment._require_torch()
         ref_hist = Alignment.to_torch_1d(ref_data, dtype=torch.float64)
         t_ns = Alignment.to_numpy_1d(t, dtype=float)
         C_ref = float(C_R)
         tau_ref_ns = float(tau_R)
-        period_ns = float(T)
+        period_ns = float(period)
 
         irf_est = torch.ones_like(ref_hist)
 
-        kernel = Alignment.to_torch_1d(Alignment.model_data(t_ns, C_ref, tau_ref_ns, period_ns))
+        kernel = Alignment.to_torch_1d(Alignment.model_data(t=t_ns, C=C_ref, tau=tau_ref_ns, period=period_ns))
+
         kernel_t = kernel.clone().flip(0)
 
         kernel = fftn(kernel, dim=0)
@@ -408,7 +654,8 @@ class Alignment:
         y = torch.clamp(ref_hist, min=0)
 
         for _ in range(iterations):
-            conv = Alignment.partial_convolution_fft(irf_est, kernel, dim1='t', dim2='t', axis='t', fourier=(0, 1))
+            #conv = Alignment.partial_convolution_fft(irf_est, kernel, dim1='t', dim2='t', axis='t', fourier=(0, 1))
+            conv = Alignment.partial_convolution_fft(irf_est, kernel, dim1="t", dim2="t", axis="t", fourier=(False, True))
             conv = torch.clamp(conv, min=eps)
             relative_blur = y / conv
             correction = Alignment.partial_convolution_fft(
@@ -449,10 +696,10 @@ class Alignment:
         period_ns = float(period)
 
         if mode=="model_shift":
-            pure_model_hist = Alignment.model_data(t_ns, C_norm, tau_ns, period_ns, shift_bins=dT_bins)
+            pure_model_hist = Alignment.model_data(t=t_ns, C=C_norm, tau=tau_ns, period=period_ns, shift_bins=dT_bins)                                                  
             irf_shifted_hist = irf_hist   
         elif mode=="irf_shift":
-            pure_model_hist = Alignment.model_data(t_ns, C_norm, tau_ns, period_ns)
+            pure_model_hist = Alignment.model_data(t=t_ns, C=C_norm, tau=tau_ns, period=period_ns)                                                  
             irf_shifted_hist = shift(irf_hist, dT_bins, order=1, mode='grid-wrap') #use scipy.ndimage.shift for sub-bin shifts with cyclic wrapping, using linear interpolation
             #irf_shifted_hist = Alignment.linear_shift(irf_hist, shift_value=dT_bins, cyclic=True) # use linear interpolation for sub-bin shifts, with cyclic wrapping
         else:
@@ -469,7 +716,19 @@ class Alignment:
         )
 
     @staticmethod
-    def perform_fit_data(t, data, irf, period, initial_tau=None, initial_dT=None, initial_C=None, mode="irf_shift"):
+    def perform_fit_data(
+        t,
+        data,
+        irf,
+        period,
+        initial_tau=None,
+        initial_dT=None,
+        initial_C=None,
+        irf_min=1e-5,
+        mode="irf_shift",
+        fit_type="circular",
+        force_C_normalized=False,
+    ):
         """
         Fit ``data`` with ``fit_model_data``.
 
@@ -477,26 +736,52 @@ class Alignment:
         - ``t`` and ``period`` are in nanoseconds.
         - ``tau`` / ``initial_tau`` are in nanoseconds.
         - ``dT`` / ``initial_dT`` are in bins.
+        - ``fit_type`` can be ``"circular"`` or ``"curve_fit"``.
+        - ``force_C_normalized=True`` keeps ``C`` fixed to ``1.0`` and only
+          fits ``dT`` and ``tau``.
         - returned ``C`` is a normalized 0..1 amplitude because the data is
-          normalized by its maximum and the IRF by its sum.
+          normalized by its sum and the IRF by its sum.
         """
         t_ns = Alignment.to_numpy_1d(t, dtype=float)
         data_hist = Alignment.to_numpy_1d(data, dtype=float)
         irf_hist = Alignment.to_numpy_1d(irf, dtype=float)
 
+
+
+
         if len(t_ns) != len(data_hist) or len(t_ns) != len(irf_hist):
             raise ValueError("t, data, and irf must have the same 1D length")
 
-        data_hist = data_hist / data_hist.max()
-        irf_hist = irf_hist / irf_hist.sum()
+        data_sum = data_hist.sum()
+        irf_sum = irf_hist.sum()
+
+        if data_sum <= 0:
+            raise ValueError("data must contain at least one positive value")
+            data_max = 1.0  # avoid division by zero, though the fit will likely fail with non-positive data
+        if irf_sum <= 0:
+            raise ValueError("irf must have a positive sum")
+
+        data_hist_norm = data_hist / data_sum
+        irf_hist_norm = irf_hist / irf_sum
         #data_hist = np.log(data_hist + 1)  # add small constant to avoid log(0)
         #irf_hist = np.log(irf_hist + 1)  # add small constant to avoid log(0)    
         
         Alignment._require_scipy_optimize()
         nbin = len(t_ns)
         fit_lambda = lambda t_ns_fit, C_norm, dT_bins, tau_ns: Alignment.fit_model_data(
-            t_ns_fit, C_norm, dT_bins, tau_ns, irf=irf_hist, period=period, mode=mode
+            t_ns_fit,
+            C_norm,
+            -dT_bins,
+            tau_ns,
+            irf=irf_hist_norm,
+            period=period,
+            mode=mode,
         )
+        fit_lambda_numpy = lambda t_ns_fit, C_norm, dT_bins, tau_ns: Alignment.to_numpy_1d(
+            fit_lambda(t_ns_fit, C_norm, dT_bins, tau_ns),
+            dtype=float,
+        )
+
 
         initial_guess = [1.0, 0.0, 1.0]
 
@@ -507,15 +792,87 @@ class Alignment:
         if initial_tau is not None:
             initial_guess[2] = initial_tau
 
-        popt, conv = scipy_optimize.curve_fit(
-            fit_lambda,
-            t_ns,
-            data_hist,
-            p0=initial_guess,
-#            bounds=([0.0, -nbin // 2, 1e-5], [np.inf, nbin // 2 + nbin % 2, t_ns.max()]),
-            bounds=([0.0, -nbin / 2, 1e-5], [np.inf, nbin / 2, t_ns.max()]),
-            maxfev=600000,
-        )
+        
+        sigma = np.sqrt(data_hist)
+        tau_lower_bound = float(irf_min)
+        if tau_lower_bound <= 0:
+            raise ValueError("irf_min must be positive")
+        fit_type = str(fit_type).lower()
+
+        if force_C_normalized:
+            fit_lambda_fixed_c = lambda t_ns_fit, dT_bins, tau_ns: fit_lambda_numpy(
+                t_ns_fit, 1.0, dT_bins, tau_ns
+            )
+            initial_guess_fixed_c = initial_guess[1:]
+            fit_bounds_fixed_c = ([-nbin / 2, tau_lower_bound], [nbin / 2, t_ns.max()])
+
+            if fit_type == "circular":
+                print("Using circular fit with curve_fit_circular and C fixed to 1.0")
+                print("initial_guess", initial_guess_fixed_c)
+                print("bounds", fit_bounds_fixed_c)
+                print("circular_params", {0: float(nbin)})
+                popt_fixed_c, conv_fixed_c = Alignment.curve_fit_circular(
+                    fit_lambda_fixed_c,
+                    t_ns,
+                    data_hist_norm,
+                    sigma=sigma,
+                    p0=initial_guess_fixed_c,
+                    bounds=fit_bounds_fixed_c,
+                    circular_params={0: float(nbin)},
+                    maxfev=600000,
+                )
+            elif fit_type == "curve_fit":
+                print("Using standard curve_fit with C fixed to 1.0")
+                print("initial_guess", initial_guess_fixed_c)
+                print("bounds", fit_bounds_fixed_c)
+                popt_fixed_c, conv_fixed_c = scipy_optimize.curve_fit(
+                    fit_lambda_fixed_c,
+                    t_ns,
+                    data_hist_norm,
+                    sigma=sigma,
+                    p0=initial_guess_fixed_c,
+                    bounds=fit_bounds_fixed_c,
+                    maxfev=600000,
+                )
+            else:
+                raise ValueError(f"Unsupported fit_type: {fit_type}. Supported circular, curve_fit")
+
+            popt = np.array([1.0, popt_fixed_c[0], popt_fixed_c[1]], dtype=float)
+            conv = np.full((3, 3), np.nan, dtype=float)
+            conv[1:, 1:] = conv_fixed_c
+        else:
+            fit_bounds = ([0.0, -nbin / 2, tau_lower_bound], [np.inf, nbin / 2, t_ns.max()])
+
+            if fit_type == "circular":
+                print("Using circular fit with curve_fit_circular")
+                print("initial_guess", initial_guess)
+                print("bounds", fit_bounds)
+                print("circular_params", {1: float(nbin)})
+                popt, conv = Alignment.curve_fit_circular(
+                    fit_lambda_numpy,
+                    t_ns,
+                    data_hist_norm,
+                    sigma=sigma,
+                    p0=initial_guess,
+                    bounds=fit_bounds,
+                    circular_params={1: float(nbin)},
+                    maxfev=600000,
+                )
+            elif fit_type == "curve_fit":
+                print("Using standard curve_fit")
+                print("initial_guess", initial_guess)
+                print("bounds", fit_bounds)
+                popt, conv = scipy_optimize.curve_fit(
+                    fit_lambda_numpy,
+                    t_ns,
+                    data_hist_norm,
+                    sigma=sigma,
+                    p0=initial_guess,
+                    bounds=fit_bounds,
+                    maxfev=600000,
+                )
+            else:
+                raise ValueError(f"Unsupported fit_type: {fit_type}. Supported circular, curve_fit")
 
         return {"C": popt[0], "dT": popt[1], "tau": popt[2]}, conv
 
@@ -663,7 +1020,7 @@ def _require_torch():
         )
 
 
-def periodic_single_exponential_model(t, C, tau, T):
+def periodic_single_exponential_model(t, C, tau, period):
     """
     Periodic single-exponential decay centered on the middle bin.
 
@@ -674,14 +1031,14 @@ def periodic_single_exponential_model(t, C, tau, T):
     C : float
         Decay amplitude.
     tau : float
-        Lifetime in the same time units as ``t`` and ``T``.
-    T : float
+        Lifetime in the same time units as ``t`` and ``period``.
+    period : float
         Excitation period in the same time units as ``t``.
     """
 
     t = np.asarray(t, dtype=float)
     offset = (t.max() - t.min()) / 2
-    return C * (np.heaviside(t - offset, 1) + 1 / (np.exp(T / tau) - 1)) * np.exp((-t + offset) / tau)
+    return C * (np.heaviside(t - offset, 1) + 1 / (np.exp(period / tau) - 1)) * np.exp((-t + offset) / tau)
 
 
 def pad_tensor(x, pad_left: int, pad_right: int, dim: int, mode: str = "reflect"):
@@ -1589,5 +1946,3 @@ def plot_flim_image(data_4D, phasors_calibrated, method='tau_phi', pxsize=0.04, 
         gra.show_flim(data_histograms, tau_m * 1e9, pxsize=pxsize, pxdwelltime=pxdwelltime,
                       lifetime_bounds=lifetime_bounds, fig=fig, ax=ax2)
         fig.tight_layout()
-
-
