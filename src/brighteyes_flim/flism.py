@@ -256,6 +256,14 @@ class Alignment:
         return torch.as_tensor(np.asarray(x), dtype=dtype, device=device)
 
     @staticmethod
+    def _normalize_histogram_1d(x, name="histogram"):
+        hist = Alignment.to_numpy_1d(x, dtype=float)
+        total = hist.sum()
+        if total <= 0:
+            raise ValueError(f"{name} must have a positive sum")
+        return hist / total
+
+    @staticmethod
     def _wrap_to_period(x, period, center=0.0):
         period = float(period)
         center = float(center)
@@ -676,6 +684,197 @@ class Alignment:
         if cyclic:
             x = np.mod(x, data.shape[0])
         return np.interp(x, xp, fp)
+
+    @staticmethod
+    def fit_data_with_ref_or_irf(
+        t,
+        data,
+        period,
+        ref=None,
+        tau_ref=None,
+        irf=None,
+        C_ref=1.0,
+        irf_output="original",
+        shift_output=None,
+        fit_type="circular",
+        mode="irf_shift",
+        initial_tau=None,
+        initial_dT=None,
+        initial_C=None,
+        force_C_normalized=False,
+        irf_iterations=30,
+        eps=1e-8,
+        regularization=3,
+    ):
+        """
+        Fit ``data`` using either ``ref`` + ``tau_ref`` or a directly provided ``irf``.
+
+        Parameters
+        ----------
+        t, data, period :
+            Same units and meaning as in ``perform_fit_data``.
+        ref : array-like, optional
+            Reference decay used to estimate the IRF through
+            ``IRF_from_data_deconvolution``. Must be provided together with
+            ``tau_ref`` when ``irf`` is not given.
+        tau_ref : float, optional
+            Known mono-exponential lifetime of ``ref`` in nanoseconds.
+        irf : array-like, optional
+            Directly provided IRF. When this is given, ``tau_ref`` is ignored.
+        C_ref : float, default 1.0
+            Reference amplitude used during IRF estimation from ``ref``.
+        irf_output : {"original", "shifted"}, default "original"
+            Controls the returned ``irf`` in the result dictionary.
+            - ``"original"`` returns the estimated IRF (if ``ref`` was used) or
+              the provided IRF (if ``irf`` was used).
+            - ``"shifted"`` returns that IRF after ``linear_shift(..., dT)``.
+        shift_output : {None, "ref", "reference", "data"}, default None
+            Optionally returns an additional shifted histogram:
+            - ``"ref"`` / ``"reference"`` returns ``ref_shifted`` using ``+dT``.
+            - ``"data"`` returns ``data_shifted`` using ``-dT``.
+
+        Returns
+        -------
+        dict
+            Result dictionary with at least:
+            - ``C``: fitted normalized amplitude
+            - ``dT``: fitted shift in bins
+            - ``dT_ns``: fitted shift in nanoseconds
+            - ``tau``: fitted lifetime in nanoseconds
+            - ``irf``: returned IRF according to ``irf_output``
+            - ``fit``: fitted histogram
+            - ``cov``: covariance matrix from ``perform_fit_data``
+            - ``irf_source``: ``"estimated_from_ref"`` or ``"provided"``
+            When requested, the dictionary also includes ``ref_shifted`` or
+            ``data_shifted``.
+
+            All histogram outputs returned by this helper are normalized to
+            unit sum. This function does not return unnormalized ``data``,
+            ``ref``, or ``irf`` histograms.
+        """
+        t_ns = Alignment.to_numpy_1d(t, dtype=float)
+        data_hist = Alignment.to_numpy_1d(data, dtype=float)
+
+        if len(t_ns) == 0:
+            raise ValueError("t must contain at least one sample")
+        if len(t_ns) != len(data_hist):
+            raise ValueError("t and data must have the same 1D length")
+
+        period_ns = float(period)
+        dt_ns = float(period_ns / len(t_ns))
+
+        data_hist_norm = Alignment._normalize_histogram_1d(data_hist, name="data")
+
+        if (ref is None) == (irf is None):
+            raise ValueError("provide exactly one of ref or irf")
+
+        irf_output = str(irf_output).lower()
+        if irf_output in {"estimated", "input", "provided", "unshifted"}:
+            irf_output = "original"
+        if irf_output not in {"original", "shifted"}:
+            raise ValueError("irf_output must be 'original' or 'shifted'")
+
+        if shift_output is not None:
+            shift_output = str(shift_output).lower()
+        if shift_output == "reference":
+            shift_output = "ref"
+        if shift_output not in {None, "ref", "data"}:
+            raise ValueError("shift_output must be None, 'ref', 'reference', or 'data'")
+
+        if irf is None:
+            if tau_ref is None:
+                raise ValueError("tau_ref is required when ref is provided and irf is not")
+
+            ref_hist = Alignment.to_numpy_1d(ref, dtype=float)
+            if len(ref_hist) != len(t_ns):
+                raise ValueError("t and ref must have the same 1D length")
+            ref_hist_norm = Alignment._normalize_histogram_1d(ref_hist, name="ref")
+            irf_hist = np.asarray(
+                Alignment.IRF_from_data_deconvolution(
+                    ref_hist_norm,
+                    t_ns,
+                    C_ref,
+                    float(tau_ref),
+                    period_ns,
+                    iterations=irf_iterations,
+                    eps=eps,
+                    regularization=regularization,
+                ),
+                dtype=float,
+            )
+            irf_source = "estimated_from_ref"
+        else:
+            ref_hist_norm = None
+            irf_hist = Alignment.to_numpy_1d(irf, dtype=float)
+            if len(irf_hist) != len(t_ns):
+                raise ValueError("t and irf must have the same 1D length")
+            if tau_ref is not None:
+                print("tau_ref ignored because irf was provided directly")
+            irf_source = "provided"
+
+        irf_hist_norm = Alignment._normalize_histogram_1d(irf_hist, name="irf")
+
+        fit_result, fit_cov = Alignment.perform_fit_data(
+            t_ns,
+            data_hist,
+            irf_hist_norm,
+            period_ns,
+            initial_tau=initial_tau,
+            initial_dT=initial_dT,
+            initial_C=initial_C,
+            mode=mode,
+            fit_type=fit_type,
+            force_C_normalized=force_C_normalized,
+        )
+
+        dT_bins = float(fit_result["dT"])
+        tau_ns = float(fit_result["tau"])
+
+        returned_irf = irf_hist_norm.copy()
+        if irf_output == "shifted":
+            returned_irf = Alignment._normalize_histogram_1d(
+                Alignment.linear_shift(returned_irf, dT_bins, cyclic=True),
+                name="shifted irf",
+            )
+
+        fitted_hist = Alignment._normalize_histogram_1d(
+            Alignment.fit_model_data(
+                t_ns,
+                fit_result["C"],
+                fit_result["dT"],
+                fit_result["tau"],
+                irf=irf_hist_norm,
+                period=period_ns,
+                mode=mode,
+            ),
+            name="fit",
+        )
+
+        result = {
+            "C": float(fit_result["C"]),
+            "dT": dT_bins,
+            "dT_ns": dT_bins * dt_ns,
+            "tau": tau_ns,
+            "irf": returned_irf,
+            "fit": fitted_hist,
+            "cov": fit_cov,
+            "irf_source": irf_source,
+        }
+
+        if shift_output == "ref":
+            if ref_hist_norm is None:
+                raise ValueError("shift_output='ref' requires ref to be provided")
+            result["ref_shifted"] = Alignment._normalize_histogram_1d(
+                Alignment.linear_shift(ref_hist_norm, dT_bins, cyclic=True),
+                name="shifted ref",
+            )
+        elif shift_output == "data":
+            result["data_shifted"] = Alignment._normalize_histogram_1d(
+                Alignment.linear_shift(data_hist_norm, -dT_bins, cyclic=True),
+                name="shifted data",
+            )
+
+        return result
 
     @staticmethod
     def fit_model_data(t, C, dT, tau, irf, period, mode="irf_shift"):
