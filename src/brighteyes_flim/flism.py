@@ -4,6 +4,7 @@ from matplotlib.pyplot import gca
 from matplotlib.colors import hsv_to_rgb
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from scipy.ndimage import median_filter
+from scipy.signal import savgol_filter
 try:
     from scipy import optimize as scipy_optimize
 except ImportError:  # pragma: no cover - optional dependency
@@ -715,10 +716,15 @@ class Alignment:
             Same units and meaning as in ``perform_fit_data``.
         ref : array-like, optional
             Reference decay used to estimate the IRF through
-            ``IRF_from_data_deconvolution``. Must be provided together with
-            ``tau_ref`` when ``irf`` is not given.
-        tau_ref : float, optional
-            Known mono-exponential lifetime of ``ref`` in nanoseconds.
+            ``IRF_from_data_deconvolution``. When ``irf`` is not given,
+            ``tau_ref`` can be provided explicitly or estimated from ``ref``.
+        tau_ref : float or str, optional
+            Lifetime of ``ref`` in nanoseconds. If omitted, it is estimated
+            from ``ref`` with ``estimate_lifetime_from_log``. String selectors
+            are also accepted:
+            - ``"circmean"`` uses ``estimate_lifetime_from_circmean``
+            - ``"birfi"`` uses ``estimate_lifetime_from_birfi``
+            - ``"log"`` uses ``estimate_lifetime_from_log``
         irf : array-like, optional
             Directly provided IRF. When this is given, ``tau_ref`` is ignored.
         C_ref : float, default 1.0
@@ -738,6 +744,8 @@ class Alignment:
         dict
             Result dictionary with at least:
             - ``C``: fitted normalized amplitude
+            - ``tau_ref``: reference lifetime actually used for IRF estimation,
+              in nanoseconds, or ``None`` when no reference lifetime was used
             - ``dT``: fitted shift in bins
             - ``dT_ns``: fitted shift in nanoseconds
             - ``tau``: fitted lifetime in nanoseconds
@@ -781,20 +789,66 @@ class Alignment:
         if shift_output not in {None, "ref", "data"}:
             raise ValueError("shift_output must be None, 'ref', 'reference', or 'data'")
 
-        if irf is None:
-            if tau_ref is None:
-                raise ValueError("tau_ref is required when ref is provided and irf is not")
+        used_tau_ref_ns = None
 
+        if irf is None:
             ref_hist = Alignment.to_numpy_1d(ref, dtype=float)
             if len(ref_hist) != len(t_ns):
                 raise ValueError("t and ref must have the same 1D length")
+
+            if tau_ref is None:
+                tau_ref_mode = "log"
+            elif isinstance(tau_ref, str):
+                tau_ref_mode = tau_ref.strip().lower()
+            else:
+                tau_ref_mode = None
+
+            if tau_ref_mode is None:
+                tau_ref_ns = float(tau_ref)
+            elif tau_ref_mode in {"log", "estimate_lifetime_from_log"}:
+                tau_ref_result = estimate_lifetime_from_log(
+                    data_hist=ref_hist,
+                    t_ns=t_ns,
+                    dt_ns=dt_ns,
+                    nbin=len(t_ns),
+                    period_ns=period_ns,
+                )
+                tau_ref_ns = tau_ref_result[0]
+            elif tau_ref_mode in {"circmean", "estimate_lifetime_from_circmean"}:
+                repetition_rate_MHz = 1e3 / period_ns
+                t0_ns = float((int(np.argmax(ref_hist)) + 0.5) * dt_ns)
+                tau_ref_ns = estimate_lifetime_from_circmean(
+                    ref_hist,
+                    t0_ns=t0_ns,
+                    repetition_rate_MHz=repetition_rate_MHz,
+                )
+            elif tau_ref_mode in {"birfi", "estimate_lifetime_from_birfi"}:
+                tau_ref_ns = estimate_lifetime_from_birfi(t_ns, ref_hist)
+            else:
+                try:
+                    tau_ref_ns = float(tau_ref)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "tau_ref must be a float, None, 'log', 'circmean', or 'birfi'"
+                    ) from exc
+
+            if tau_ref_ns is None:
+                raise ValueError("unable to estimate tau_ref from ref")
+            tau_ref_ns_array = np.asarray(tau_ref_ns, dtype=float)
+            if tau_ref_ns_array.size != 1:
+                raise ValueError("tau_ref estimator must return a scalar lifetime")
+            tau_ref_ns = float(tau_ref_ns_array.reshape(-1)[0])
+            if not np.isfinite(tau_ref_ns) or tau_ref_ns <= 0:
+                raise ValueError("unable to estimate a valid positive tau_ref from ref")
+            used_tau_ref_ns = tau_ref_ns
+
             ref_hist_norm = Alignment._normalize_histogram_1d(ref_hist, name="ref")
             irf_hist = np.asarray(
                 Alignment.IRF_from_data_deconvolution(
                     ref_hist_norm,
                     t_ns,
                     C_ref,
-                    float(tau_ref),
+                    tau_ref_ns,
                     period_ns,
                     iterations=irf_iterations,
                     eps=eps,
@@ -852,6 +906,7 @@ class Alignment:
 
         result = {
             "C": float(fit_result["C"]),
+            "tau_ref": used_tau_ref_ns,
             "dT": dT_bins,
             "dT_ns": dT_bins * dt_ns,
             "tau": tau_ns,
@@ -1458,6 +1513,258 @@ def estimate_irf(ref_data, t, C_R, tau, period, iterations=300, eps=1e-8, regula
         eps=eps,
         regularization=regularization,
     )
+
+def estimate_lifetime_from_birfi(
+    x,
+    y,
+    window_length=11,
+    polyorder=3,
+    persistence=5,
+    threshold=0.05,
+    axis=0,
+    return_bounds=False,
+):
+    """
+    Estimate fluorescence lifetime from the centroid of a detected decay window.
+    (from birfi)
+
+    The function merges decay-window detection and centroid lifetime estimation
+    into a NumPy-based utility. The start index ``t0`` is defined as the global
+    minimum of the Savitzky-Golay first derivative. The end index ``t1`` is the
+    first point after ``t0`` where the derivative stays positive on average for
+    ``persistence`` samples and the signal amplitude remains above a fraction of
+    the channel dynamic range.
+
+    Parameters
+    ----------
+    x : array-like, shape (n_time,)
+        Time axis.
+    y : array-like
+        Decay histogram. Accepted shapes are ``(n_time,)`` or multi-channel
+        arrays with the time dimension specified by ``axis``.
+    window_length : int, default 11
+        Savitzky-Golay window length. Must be odd and greater than
+        ``polyorder``.
+    polyorder : int, default 3
+        Savitzky-Golay polynomial order.
+    persistence : int, default 5
+        Number of consecutive derivative samples used to confirm ``t1``.
+    threshold : float, default 0.05
+        Minimum signal amplitude, expressed as a fraction of the per-channel
+        range, required for ``t1`` detection.
+    axis : int, default 0
+        Time axis in ``y``.
+    return_bounds : bool, default False
+        If ``True``, also return the detected ``t0`` and ``t1`` indices.
+
+    Returns
+    -------
+    float or ndarray
+        Lifetime estimate(s). Returns a scalar for 1D input and an array for
+        multi-channel input.
+    tuple
+        When ``return_bounds=True``, returns ``(tau, t0, t1)``.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    if x.ndim != 1:
+        raise ValueError("x must be a 1D time axis")
+    if y.ndim == 0:
+        raise ValueError("y must contain at least one sample")
+    if y.shape[axis] != x.shape[0]:
+        raise ValueError("x and y must have matching lengths along the time axis")
+
+    y_moved = np.moveaxis(y, axis, 0)
+    original_shape = y_moved.shape[1:]
+    y_2d = y_moved.reshape(x.shape[0], -1)
+    n_time = y_2d.shape[0]
+
+    if n_time < 3:
+        raise ValueError("at least three time samples are required")
+    if persistence < 1:
+        raise ValueError("persistence must be at least 1")
+    if window_length % 2 == 0:
+        raise ValueError("window_length must be odd")
+    if window_length > n_time:
+        raise ValueError("window_length cannot exceed the number of time samples")
+    if polyorder >= window_length:
+        raise ValueError("polyorder must be smaller than window_length")
+
+    delta = float(np.mean(np.diff(x))) if n_time > 1 else 1.0
+    dy = savgol_filter(
+        y_2d,
+        window_length=window_length,
+        polyorder=polyorder,
+        deriv=1,
+        delta=delta,
+        axis=0,
+        mode="interp",
+    )
+
+    t0 = np.argmin(dy, axis=0)
+    y_min = np.min(y_2d, axis=0)
+    y_range = np.max(y_2d, axis=0) - y_min
+    t1 = np.full(y_2d.shape[1], n_time - 1, dtype=int)
+    tau = np.full(y_2d.shape[1], np.nan, dtype=float)
+
+    for ch in range(y_2d.shape[1]):
+        stop = n_time - persistence
+        for idx in range(t0[ch] + 1, stop):
+            avg_diff = np.mean(dy[idx:idx + persistence, ch])
+            amplitude = max(y_2d[idx + persistence, ch] - y_min[ch], 0.0)
+            if avg_diff > 0.0 and amplitude > threshold * y_range[ch]:
+                t1[ch] = idx
+                break
+
+        x_window = x[t0[ch]:t1[ch] + 1]
+        y_window = y_2d[t0[ch]:t1[ch] + 1, ch]
+        x_local = x_window - np.min(x_window)
+        y_clamped = np.clip(y_window - np.min(y_window), a_min=0.0, a_max=None)
+        weight_sum = np.sum(y_clamped)
+        if weight_sum > 0.0:
+            tau[ch] = np.sum(x_local * y_clamped) / weight_sum
+
+    tau = tau.reshape(original_shape) if original_shape else tau[0]
+    t0 = t0.reshape(original_shape) if original_shape else int(t0[0])
+    t1 = t1.reshape(original_shape) if original_shape else int(t1[0])
+
+    if return_bounds:
+        return tau, t0, t1
+    return tau
+
+def estimate_lifetime_from_log(
+    data_hist,
+    t_ns,
+    dt_ns,
+    nbin,
+    period_ns,
+    start_level=0.95,
+    end_level=0.25,
+):
+    data_hist = np.asarray(data_hist, dtype=float)
+    t_ns = np.asarray(t_ns, dtype=float)
+    if (
+        data_hist.size < 4
+        or t_ns.size != data_hist.size
+        or not np.isfinite(dt_ns)
+        or dt_ns <= 0
+        or nbin <= 0
+        or not np.isfinite(period_ns)
+        or period_ns <= 0
+        or not np.isfinite(start_level)
+        or not np.isfinite(end_level)
+        or not (0.0 < end_level < start_level < 1.0)
+    ):
+        return None, None, None, None, None
+
+    peak_idx = int(np.argmax(data_hist))
+    trace_sum_peak0 = np.roll(data_hist, -peak_idx)
+    trace_x_peak0_ns = np.roll(
+        np.mod(t_ns - t_ns[peak_idx], period_ns),
+        -peak_idx,
+    )
+
+    peak_value = float(trace_sum_peak0[0])
+    if not np.isfinite(peak_value) or peak_value <= 0:
+        #print_dec("FIT: invalid peak value")
+        return None, None, peak_idx, trace_sum_peak0, trace_x_peak0_ns
+
+    y_start = start_level * peak_value
+    idx_start_candidates = np.flatnonzero(trace_sum_peak0 <= y_start)
+    fallback_levels = [end_level, 0.30, 0.40]
+    fallback_levels = [level for level in fallback_levels if 0.0 < level < start_level]
+    fallback_levels = list(dict.fromkeys(fallback_levels))
+    selected_end_level = None
+    idx_end_candidates = np.asarray([], dtype=int)
+    y_end = None
+    for candidate_end_level in fallback_levels:
+        y_end_candidate = candidate_end_level * peak_value
+        idx_end_candidate = np.flatnonzero(trace_sum_peak0 <= y_end_candidate)
+        if idx_start_candidates.size != 0 and idx_end_candidate.size != 0:
+            selected_end_level = candidate_end_level
+            idx_end_candidates = idx_end_candidate
+            y_end = y_end_candidate
+            break
+
+    if idx_start_candidates.size == 0 or idx_end_candidates.size == 0:
+        #print_dec("FIT: y_start, y_end, idx_start_candidates, idx_end_candidates", y_start, y_end, idx_start_candidates, idx_end_candidates)
+        #print_dec("FIT: no candidates for start or end indices")
+        return None, None, peak_idx, trace_sum_peak0, trace_x_peak0_ns
+
+    #print_dec("FIT: start_level, selected_end_level", start_level, selected_end_level)
+
+    start_idx = int(idx_start_candidates[0])
+    end_idx = int(idx_end_candidates[0])
+    if end_idx <= start_idx:
+        #print_dec("FIT: end_idx <= start_idx")
+        return None, None, peak_idx, trace_sum_peak0, trace_x_peak0_ns
+
+    y_section = trace_sum_peak0[start_idx : end_idx + 1]
+    x_section_ns = trace_x_peak0_ns[start_idx : end_idx + 1]
+    positive = y_section > 0
+    if np.count_nonzero(positive) < 4:
+        #print_dec("FIT: np.count_nonzero(positive) < 4")
+        return None, None, peak_idx, trace_sum_peak0, trace_x_peak0_ns
+
+    x_fit_bins = np.arange(start_idx, end_idx + 1, dtype=float)[positive]
+    x_fit_ns = x_section_ns[positive]
+    y_fit_input = y_section[positive]
+    slope, intercept = np.polyfit(x_fit_bins, np.log(y_fit_input), 1)
+    #print_dec("FIT: slope and intercept", slope, intercept)
+    if not np.isfinite(slope) or slope >= 0:
+        return None, None, peak_idx, trace_sum_peak0, trace_x_peak0_ns
+
+    tau_ns = -float(dt_ns) / slope
+    if not np.isfinite(tau_ns) or tau_ns <= 0:
+        return None, None, peak_idx, trace_sum_peak0, trace_x_peak0_ns
+
+    y_fit = np.exp(intercept + slope * x_fit_bins)
+    x_fit_bins_plot = np.mod(x_fit_bins + int(peak_idx), int(nbin))
+    x_fit_ns_plot = np.mod(x_fit_ns + int(peak_idx) * dt_ns, period_ns)
+
+    fit_curve = {
+        "fit_len": int(end_idx - start_idx + 1),
+        "x_fit_bins": x_fit_bins_plot,
+        "x_fit_ns": x_fit_ns_plot,
+        "y_fit": y_fit,
+    }
+    return float(tau_ns), fit_curve, peak_idx, trace_sum_peak0, trace_x_peak0_ns
+
+
+def estimate_lifetime_from_circmean(counts, t0_ns, repetition_rate_MHz=40.0,
+                                 background_per_bin=0.0, truncate_ns=None):
+    y = np.asarray(counts, dtype=float)
+    n = y.size
+
+    Tcycle_ns = 1e3 / repetition_rate_MHz
+    dt_ns = Tcycle_ns / n
+
+    # Bin centers
+    t_ns = (np.arange(n) + 0.5) * dt_ns
+
+    # CYCLIC forward delay from t0
+    delay_ns = (t_ns - t0_ns) % Tcycle_ns
+
+    # Background subtraction
+    w = np.clip(y - background_per_bin, 0.0, None)
+
+    # Optional truncation in the cyclic-delay domain
+    if truncate_ns is not None:
+        keep = delay_ns < truncate_ns
+        w = w[keep]
+        delay_ns = delay_ns[keep]
+
+    s0 = np.sum(w)
+    if s0 <= 0:
+        return np.nan
+
+    tau_ns = np.sum(w * delay_ns) / s0
+    return tau_ns
+
+
+
+
 
 
 def plot_universal_circle(ax=None):

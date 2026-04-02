@@ -1,4 +1,7 @@
-from .flism import Alignment
+from .flism import (Alignment,
+                    estimate_lifetime_from_birfi,
+                    estimate_lifetime_from_circmean,
+                    estimate_lifetime_from_log)
 from brighteyes_ism.dataio import mcs
 
 
@@ -27,4 +30,7 @@ __all__ = [
     "phasor_delay_from_hist",
     "phasor_delay_from_hist_in_units",
     "rectangular_IRF",
+    "estimate_lifetime_from_birfi",
+    "estimate_lifetime_from_log",
+    "estimate_lifetime_from_circmean",    
 ]
