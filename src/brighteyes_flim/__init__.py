@@ -1,4 +1,6 @@
 from .flism import (Alignment,
+                    H5DataCalibrator,
+                    calibrate_h5_file,
                     estimate_lifetime_from_birfi,
                     estimate_lifetime_from_circmean,
                     estimate_lifetime_from_log)
@@ -18,7 +20,9 @@ rectangular_IRF = Alignment.rectangular_IRF
 
 __all__ = [
     "Alignment",
+    "H5DataCalibrator",
     "IRF_from_data_deconvolution",
+    "calibrate_h5_file",
     "curve_fit_circular",
     "fit_data_with_ref_or_irf",
     "fit_model_data",

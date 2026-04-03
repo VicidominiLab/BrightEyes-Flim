@@ -1,8 +1,11 @@
 from matplotlib import colors
+import json
 import numpy as np
+from pathlib import Path
 from matplotlib.pyplot import gca
 from matplotlib.colors import hsv_to_rgb
 from mpl_toolkits.axes_grid1 import make_axes_locatable
+import shutil
 from scipy.ndimage import median_filter
 from scipy.signal import savgol_filter
 try:
@@ -25,6 +28,530 @@ except ImportError:  # pragma: no cover - optional dependency
     fftn = ifftn = ifftshift = None
 
 import brighteyes_ism.dataio.mcs as mcs
+
+
+class H5DataCalibrator:
+    """
+    Calibrate per-channel FLIM histograms stored in HDF5 files.
+
+    The input datasets are expected to have shape
+    ``[repetition, z, y, x, t, ch]``. Only one channel histogram at a time is
+    materialized in memory, so the whole 6D dataset is never converted to a
+    NumPy array up front.
+    """
+
+    DEFAULT_DATA_KEYS = ("data",)
+
+    def __init__(
+        self,
+        data_path,
+        reference_path,
+        data_key="data",
+        reference_key=None,
+        reference_type="ref",
+        tau_ref=None,
+        fit_mode="model_shift",
+        fit_type="circular",
+        C_ref=1.0,
+        output_path=None,
+        overwrite=True,
+        channels=None,
+        calibration_key="calibration",
+        period_ns=None,
+        initial_tau=None,
+        initial_dT=None,
+        initial_C=None,
+        force_C_normalized=False,
+        irf_iterations=30,
+        eps=1e-8,
+        regularization=3,
+    ):
+        self.data_path = Path(data_path)
+        self.reference_path = Path(reference_path)
+        self.data_key = data_key
+        self.reference_key = reference_key if reference_key is not None else data_key
+        self.reference_type = self._normalize_reference_type(reference_type)
+        self.tau_ref = tau_ref
+        self.fit_mode = fit_mode
+        self.fit_type = fit_type
+        self.C_ref = C_ref
+        self.output_path = Path(output_path) if output_path is not None else self._default_output_path()
+        self.overwrite = overwrite
+        self.channels = channels
+        self.calibration_key = calibration_key
+        self.period_ns = period_ns
+        self.initial_tau = initial_tau
+        self.initial_dT = initial_dT
+        self.initial_C = initial_C
+        self.force_C_normalized = force_C_normalized
+        self.irf_iterations = irf_iterations
+        self.eps = eps
+        self.regularization = regularization
+
+    @staticmethod
+    def _normalize_reference_type(reference_type):
+        normalized = str(reference_type).strip().lower()
+        aliases = {
+            "reference": "ref",
+            "reference_histogram": "ref",
+            "ref_histogram": "ref",
+            "fluorescence_reference": "ref",
+            "irf_histogram": "irf",
+            "input_irf": "irf",
+        }
+        normalized = aliases.get(normalized, normalized)
+        if normalized not in {"ref", "irf"}:
+            raise ValueError("reference_type must be 'ref' or 'irf'")
+        return normalized
+
+    def _default_output_path(self):
+        suffix = self.data_path.suffix or ".h5"
+        return self.data_path.with_name(f"{self.data_path.stem}_calib{suffix}")
+
+    @staticmethod
+    def _metadata_get(metadata, key, default=None):
+        if metadata is None:
+            return default
+        if isinstance(metadata, dict):
+            return metadata.get(key, default)
+        if hasattr(metadata, "get"):
+            try:
+                return metadata.get(key, default)
+            except TypeError:
+                pass
+        return getattr(metadata, key, default)
+
+    @staticmethod
+    def _metadata_items(metadata):
+        if metadata is None:
+            return []
+        if isinstance(metadata, dict):
+            return list(metadata.items())
+        if hasattr(metadata, "items"):
+            try:
+                return list(metadata.items())
+            except TypeError:
+                pass
+        if hasattr(metadata, "__dict__") and vars(metadata):
+            return [(key, value) for key, value in vars(metadata).items() if not key.startswith("_")]
+
+        items = []
+        for key in dir(metadata):
+            if key.startswith("_"):
+                continue
+            try:
+                value = getattr(metadata, key)
+            except Exception:
+                continue
+            if callable(value):
+                continue
+            items.append((key, value))
+        return items
+
+    @staticmethod
+    def build_time_axis(metadata, nbin=None, period_ns=None):
+        if nbin is None:
+            metadata_nbin = H5DataCalibrator._metadata_get(metadata, "dfd_nbins")
+            if metadata_nbin is None:
+                raise ValueError("metadata must provide dfd_nbins or nbin must be passed explicitly")
+            nbin = int(metadata_nbin)
+        else:
+            nbin = int(nbin)
+
+        if nbin <= 0:
+            raise ValueError("nbin must be positive")
+
+        if period_ns is None:
+            dfd_freq_MHz = H5DataCalibrator._metadata_get(metadata, "dfd_freq")
+            if dfd_freq_MHz is None:
+                raise ValueError("metadata must provide dfd_freq or period_ns must be passed explicitly")
+            dfd_freq_MHz = float(dfd_freq_MHz)
+            if not np.isfinite(dfd_freq_MHz) or dfd_freq_MHz <= 0:
+                raise ValueError("metadata.dfd_freq must be a positive finite value")
+            period_ns = 1e3 / dfd_freq_MHz
+        else:
+            period_ns = float(period_ns)
+
+        if not np.isfinite(period_ns) or period_ns <= 0:
+            raise ValueError("period_ns must be a positive finite value")
+
+        dt_ns = period_ns / nbin
+        t_ns = np.arange(nbin, dtype=float) * dt_ns
+        return nbin, dt_ns, period_ns, t_ns
+
+    @staticmethod
+    def _open_dataset(handle, key=None):
+        if key is not None:
+            if key not in handle:
+                raise KeyError(f"dataset key {key!r} not found in {handle.filename!r}")
+            dataset = handle[key]
+        else:
+            dataset = None
+            for candidate in H5DataCalibrator.DEFAULT_DATA_KEYS:
+                if candidate in handle:
+                    dataset = handle[candidate]
+                    break
+            if dataset is None:
+                raise KeyError(
+                    f"no default dataset found in {handle.filename!r}; "
+                    f"tried {H5DataCalibrator.DEFAULT_DATA_KEYS}"
+                )
+
+        if not isinstance(dataset, h5py.Dataset):
+            raise TypeError(f"{key!r} in {handle.filename!r} is not an HDF5 dataset")
+        return dataset
+
+    @staticmethod
+    def _validate_dataset_layout(dataset, name):
+        if dataset.ndim != 6:
+            raise ValueError(
+                f"{name} dataset must have shape [repetition, z, y, x, t, ch], got {dataset.shape}"
+            )
+        if dataset.shape[-2] <= 0 or dataset.shape[-1] <= 0:
+            raise ValueError(f"{name} dataset must contain positive time and channel dimensions")
+
+    @staticmethod
+    def _resolve_channels(channels, channel_count):
+        if channels is None:
+            return list(range(int(channel_count)))
+
+        resolved = []
+        for channel in channels:
+            channel_index = int(channel)
+            if channel_index < 0 or channel_index >= channel_count:
+                raise IndexError(f"channel {channel_index} out of range for {channel_count} channels")
+            resolved.append(channel_index)
+
+        if len(set(resolved)) != len(resolved):
+            raise ValueError("channels must not contain duplicates")
+        return resolved
+
+    @staticmethod
+    def _resolve_reference_channel_map(data_dataset, reference_dataset):
+        data_channel_count = int(data_dataset.shape[-1])
+        reference_channel_count = int(reference_dataset.shape[-1])
+
+        if reference_channel_count == data_channel_count:
+            return {channel: channel for channel in range(data_channel_count)}
+        if reference_channel_count == 1:
+            return {channel: 0 for channel in range(data_channel_count)}
+
+        raise ValueError(
+            "reference dataset must have either the same number of channels as data "
+            "or exactly one channel"
+        )
+
+    @staticmethod
+    def _sum_histogram_for_channel(dataset, channel_index):
+        nbin = int(dataset.shape[-2])
+        histogram = np.zeros(nbin, dtype=np.float64)
+
+        for repetition_index in range(int(dataset.shape[0])):
+            for z_index in range(int(dataset.shape[1])):
+                histogram += np.asarray(
+                    dataset[repetition_index, z_index, :, :, :, channel_index],
+                    dtype=np.float64,
+                ).sum(axis=(0, 1))
+
+        return histogram
+
+    @staticmethod
+    def _prepare_attr_value(value):
+        if value is None:
+            return "None"
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, (str, bytes)):
+            return value
+        if isinstance(value, (bool, np.bool_)):
+            return bool(value)
+        if isinstance(value, (int, np.integer)):
+            return int(value)
+        if isinstance(value, (float, np.floating)):
+            return float(value)
+        if isinstance(value, np.ndarray):
+            if value.ndim == 0:
+                return H5DataCalibrator._prepare_attr_value(value.item())
+            if value.dtype.kind in {"i", "u", "f", "b"}:
+                return value
+            return json.dumps(value.tolist(), default=str)
+        if isinstance(value, (list, tuple, dict, set)):
+            return json.dumps(value, default=str)
+        return str(value)
+
+    @classmethod
+    def _set_group_attrs(cls, group, attrs):
+        for key, value in attrs.items():
+            group.attrs[str(key)] = cls._prepare_attr_value(value)
+
+    @classmethod
+    def _write_metadata_group(cls, parent_group, group_name, metadata):
+        metadata_group = parent_group.create_group(group_name)
+        for key, value in cls._metadata_items(metadata):
+            metadata_group.attrs[str(key)] = cls._prepare_attr_value(value)
+        return metadata_group
+
+    @staticmethod
+    def _replace_dataset(group, name, data):
+        if name in group:
+            del group[name]
+        array = np.asarray(data)
+        kwargs = {}
+        if array.ndim > 0 and array.size > 0:
+            kwargs["compression"] = "gzip"
+        return group.create_dataset(name, data=array, **kwargs)
+
+    @staticmethod
+    def _format_tau_ref_input(tau_ref):
+        if tau_ref is None:
+            return "None"
+        if isinstance(tau_ref, str):
+            return tau_ref
+        try:
+            return float(tau_ref)
+        except (TypeError, ValueError):
+            return str(tau_ref)
+
+    def _prepare_output_file(self):
+        if self.output_path.resolve() == self.data_path.resolve():
+            raise ValueError("output_path must be different from data_path")
+        if self.output_path.exists():
+            if not self.overwrite:
+                raise FileExistsError(f"output file already exists: {self.output_path}")
+            self.output_path.unlink()
+        shutil.copy2(self.data_path, self.output_path)
+        return self.output_path
+
+    def calibrate(self):
+        data_metadata = mcs.metadata_load(str(self.data_path))
+        reference_metadata = mcs.metadata_load(str(self.reference_path))
+        output_path = self._prepare_output_file()
+
+        with h5py.File(self.data_path, "r") as data_handle, \
+             h5py.File(self.reference_path, "r") as reference_handle, \
+             h5py.File(output_path, "a") as output_handle:
+
+            data_dataset = self._open_dataset(data_handle, self.data_key)
+            reference_dataset = self._open_dataset(reference_handle, self.reference_key)
+
+            self._validate_dataset_layout(data_dataset, "data")
+            self._validate_dataset_layout(reference_dataset, "reference")
+
+            if data_dataset.shape[-2] != reference_dataset.shape[-2]:
+                raise ValueError(
+                    "data and reference datasets must have the same number of time bins "
+                    f"(got {data_dataset.shape[-2]} and {reference_dataset.shape[-2]})"
+                )
+
+            channel_indices = self._resolve_channels(self.channels, int(data_dataset.shape[-1]))
+            reference_channel_map = self._resolve_reference_channel_map(data_dataset, reference_dataset)
+            if len(channel_indices) == 0:
+                raise ValueError("channels must contain at least one channel index")
+
+            nbin, dt_ns, period_ns, t_ns = self.build_time_axis(
+                data_metadata,
+                nbin=int(data_dataset.shape[-2]),
+                period_ns=self.period_ns,
+            )
+
+            if self.calibration_key in output_handle:
+                del output_handle[self.calibration_key]
+            calibration_group = output_handle.create_group(self.calibration_key)
+
+            self._set_group_attrs(
+                calibration_group,
+                {
+                    "source_data_file": str(self.data_path),
+                    "source_reference_file": str(self.reference_path),
+                    "output_file": str(output_path),
+                    "data_key": self.data_key,
+                    "reference_key": self.reference_key,
+                    "reference_type": self.reference_type,
+                    "tau_ref_input": self._format_tau_ref_input(self.tau_ref),
+                    "fit_mode": self.fit_mode,
+                    "fit_type": self.fit_type,
+                    "C_ref": self.C_ref,
+                    "irf_iterations": self.irf_iterations,
+                    "eps": self.eps,
+                    "regularization": self.regularization,
+                    "initial_tau": self.initial_tau,
+                    "initial_dT": self.initial_dT,
+                    "initial_C": self.initial_C,
+                    "force_C_normalized": self.force_C_normalized,
+                    "nbin": nbin,
+                    "dt_ns": dt_ns,
+                    "period_ns": period_ns,
+                    "channel_count": int(data_dataset.shape[-1]),
+                    "channel_count_calibrated": len(channel_indices),
+                    "data_shape": list(data_dataset.shape),
+                    "reference_shape": list(reference_dataset.shape),
+                },
+            )
+            self._write_metadata_group(calibration_group, "input_data_metadata", data_metadata)
+            self._write_metadata_group(calibration_group, "input_reference_metadata", reference_metadata)
+
+            calibration_group.attrs["channel_axis"] = -1
+            calibration_group.attrs["stacked_histogram_layout"] = "(t, ch)"
+            calibration_group.attrs["stacked_covariance_layout"] = "(param, param, ch)"
+
+            stacked_channel_index = []
+            stacked_reference_channel_index = []
+            stacked_C = []
+            stacked_tau = []
+            stacked_tau_ref = []
+            stacked_dT_bins = []
+            stacked_dT_ns = []
+            stacked_irf_source = []
+            stacked_covariance = []
+            stacked_data_histogram = []
+            stacked_data_histogram_normalized = []
+            stacked_irf_original = []
+            stacked_irf_calibrated = []
+            stacked_fit = []
+            stacked_ref_original = []
+            stacked_ref_calibrated = []
+
+            for channel_index in channel_indices:
+                reference_channel_index = reference_channel_map[channel_index]
+                data_histogram = self._sum_histogram_for_channel(data_dataset, channel_index)
+                reference_histogram = self._sum_histogram_for_channel(reference_dataset, reference_channel_index)
+
+                fit_kwargs = {
+                    "t": t_ns,
+                    "data": data_histogram,
+                    "period": period_ns,
+                    "C_ref": self.C_ref,
+                    "irf_output": "original",
+                    "shift_output": "ref" if self.reference_type == "ref" else None,
+                    "fit_type": self.fit_type,
+                    "mode": self.fit_mode,
+                    "initial_tau": self.initial_tau,
+                    "initial_dT": self.initial_dT,
+                    "initial_C": self.initial_C,
+                    "force_C_normalized": self.force_C_normalized,
+                    "irf_iterations": self.irf_iterations,
+                    "eps": self.eps,
+                    "regularization": self.regularization,
+                }
+                if self.reference_type == "ref":
+                    fit_kwargs["ref"] = reference_histogram
+                    fit_kwargs["tau_ref"] = self.tau_ref
+                else:
+                    fit_kwargs["irf"] = reference_histogram
+
+                fit_result = Alignment.fit_data_with_ref_or_irf(**fit_kwargs)
+
+                irf_original = np.asarray(fit_result["irf"], dtype=float)
+                irf_calibrated = Alignment._normalize_histogram_1d(
+                    Alignment.linear_shift(irf_original, fit_result["dT"], cyclic=True),
+                    name="irf_calibrated",
+                )
+                data_histogram_normalized = Alignment._normalize_histogram_1d(
+                    data_histogram,
+                    name="data_histogram",
+                )
+
+                stacked_channel_index.append(channel_index)
+                stacked_reference_channel_index.append(reference_channel_index)
+                stacked_C.append(float(fit_result["C"]))
+                stacked_tau.append(float(fit_result["tau"]))
+                stacked_tau_ref.append(
+                    np.nan if fit_result["tau_ref"] is None else float(fit_result["tau_ref"])
+                )
+                stacked_dT_bins.append(float(fit_result["dT"]))
+                stacked_dT_ns.append(float(fit_result["dT_ns"]))
+                stacked_irf_source.append(str(fit_result["irf_source"]))
+                stacked_covariance.append(np.asarray(fit_result["cov"], dtype=float))
+                stacked_data_histogram.append(np.asarray(data_histogram, dtype=float))
+                stacked_data_histogram_normalized.append(np.asarray(data_histogram_normalized, dtype=float))
+                stacked_irf_original.append(np.asarray(irf_original, dtype=float))
+                stacked_irf_calibrated.append(np.asarray(irf_calibrated, dtype=float))
+                stacked_fit.append(np.asarray(fit_result["fit"], dtype=float))
+                if self.reference_type == "ref":
+                    stacked_ref_original.append(np.asarray(reference_histogram, dtype=float))
+                    stacked_ref_calibrated.append(np.asarray(fit_result["ref_shifted"], dtype=float))
+
+            self._replace_dataset(
+                calibration_group,
+                "channel_index",
+                np.asarray(stacked_channel_index, dtype=int),
+            )
+            self._replace_dataset(
+                calibration_group,
+                "reference_channel_index",
+                np.asarray(stacked_reference_channel_index, dtype=int),
+            )
+            self._replace_dataset(calibration_group, "C", np.asarray(stacked_C, dtype=float))
+            self._replace_dataset(calibration_group, "tau_ns", np.asarray(stacked_tau, dtype=float))
+            self._replace_dataset(calibration_group, "tau_ref_ns", np.asarray(stacked_tau_ref, dtype=float))
+            self._replace_dataset(
+                calibration_group,
+                "delta_t_correction_bins",
+                np.asarray(stacked_dT_bins, dtype=float),
+            )
+            self._replace_dataset(
+                calibration_group,
+                "delta_t_correction_ns",
+                np.asarray(stacked_dT_ns, dtype=float),
+            )
+            self._replace_dataset(
+                calibration_group,
+                "covariance",
+                np.stack(stacked_covariance, axis=-1),
+            )
+            self._replace_dataset(
+                calibration_group,
+                "data_histogram",
+                np.stack(stacked_data_histogram, axis=-1),
+            )
+            self._replace_dataset(
+                calibration_group,
+                "data_histogram_normalized",
+                np.stack(stacked_data_histogram_normalized, axis=-1),
+            )
+            self._replace_dataset(
+                calibration_group,
+                "irf_original",
+                np.stack(stacked_irf_original, axis=-1),
+            )
+            self._replace_dataset(
+                calibration_group,
+                "irf_calibrated",
+                np.stack(stacked_irf_calibrated, axis=-1),
+            )
+            self._replace_dataset(
+                calibration_group,
+                "fit",
+                np.stack(stacked_fit, axis=-1),
+            )
+            if self.reference_type == "ref":
+                self._replace_dataset(
+                    calibration_group,
+                    "ref_original",
+                    np.stack(stacked_ref_original, axis=-1),
+                )
+                self._replace_dataset(
+                    calibration_group,
+                    "ref_calibrated",
+                    np.stack(stacked_ref_calibrated, axis=-1),
+                )
+            string_dtype = h5py.string_dtype(encoding="utf-8")
+            if "irf_source" in calibration_group:
+                del calibration_group["irf_source"]
+            calibration_group.create_dataset(
+                "irf_source",
+                data=np.asarray(stacked_irf_source, dtype=object),
+                dtype=string_dtype,
+            )
+
+        return str(output_path)
+
+
+def calibrate_h5_file(data_path, reference_path, **kwargs):
+    """
+    Convenience wrapper for :class:`H5DataCalibrator`.
+    """
+    return H5DataCalibrator(data_path, reference_path, **kwargs).calibrate()
 
 
 class FlimData:
