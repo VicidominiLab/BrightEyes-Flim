@@ -21,6 +21,17 @@ __all__ = [
     "show_h5_structure_html",
 ]
 
+DEFAULT_DATA_KEY = ("data", "data_channels_extra")
+DEFAULT_REFERENCE_KEY = ("data", "data_channels_extra")
+DEFAULT_TAU_REF = None
+DEFAULT_REFERENCE_TYPE = "ref"
+DEFAULT_FIT_MODE = "model_shift"
+DEFAULT_FIT_TYPE = "circular"
+DEFAULT_C_REF = 1.0
+DEFAULT_IRF_ITERATIONS = 300
+DEFAULT_REGULARIZATION = 0
+DEFAULT_OVERWRITE = True
+
 class H5DataCalibrator:
     """
     Calibrate per-channel FLIM histograms stored in HDF5 files.
@@ -31,21 +42,21 @@ class H5DataCalibrator:
     NumPy array up front.
     """
 
-    DEFAULT_DATA_KEYS = ("data", "data_extra",)
+    DEFAULT_DATA_KEYS = DEFAULT_DATA_KEY
 
     def __init__(
         self,
         data_path,
         reference_path,
-        data_key="data",
+        data_key=DEFAULT_DATA_KEY,
         reference_key=None,
-        reference_type="ref",
-        tau_ref=None,
-        fit_mode="model_shift",
-        fit_type="circular",
-        C_ref=1.0,
+        reference_type=DEFAULT_REFERENCE_TYPE,
+        tau_ref=DEFAULT_TAU_REF,
+        fit_mode=DEFAULT_FIT_MODE,
+        fit_type=DEFAULT_FIT_TYPE,
+        C_ref=DEFAULT_C_REF,
         output_path=None,
-        overwrite=True,
+        overwrite=DEFAULT_OVERWRITE,
         channels=None,
         calibration_key="calibration",
         period_ns=None,
@@ -53,9 +64,9 @@ class H5DataCalibrator:
         initial_dT=None,
         initial_C=None,
         force_C_normalized=False,
-        irf_iterations=30,
+        irf_iterations=DEFAULT_IRF_ITERATIONS,
         eps=1e-8,
-        regularization=3,
+        regularization=DEFAULT_REGULARIZATION,
     ):
         self.data_path = Path(data_path)
         self.reference_path = Path(reference_path)
@@ -723,11 +734,39 @@ class H5DataCalibrator:
         return str(output_path)
 
 
-def calibrate_h5_file(data_path, reference_path, **kwargs):
+def calibrate_h5_file(
+    data_path,
+    reference_path,
+    data_key=DEFAULT_DATA_KEY,
+    reference_key=DEFAULT_REFERENCE_KEY,
+    reference_type=DEFAULT_REFERENCE_TYPE,
+    tau_ref=DEFAULT_TAU_REF,
+    fit_mode=DEFAULT_FIT_MODE,
+    fit_type=DEFAULT_FIT_TYPE,
+    C_ref=DEFAULT_C_REF,
+    irf_iterations=DEFAULT_IRF_ITERATIONS,
+    regularization=DEFAULT_REGULARIZATION,
+    overwrite=DEFAULT_OVERWRITE,
+    **kwargs,
+):
     """
     Convenience wrapper for :class:`H5DataCalibrator`.
     """
-    return H5DataCalibrator(data_path, reference_path, **kwargs).calibrate()
+    return H5DataCalibrator(
+        data_path,
+        reference_path,
+        data_key=data_key,
+        reference_key=reference_key,
+        reference_type=reference_type,
+        tau_ref=tau_ref,
+        fit_mode=fit_mode,
+        fit_type=fit_type,
+        C_ref=C_ref,
+        irf_iterations=irf_iterations,
+        regularization=regularization,
+        overwrite=overwrite,
+        **kwargs,
+    ).calibrate()
 
 
 def show_h5_structure(file_path, include_attrs=True, attrs_inline=False):
