@@ -32,10 +32,68 @@ DEFAULT_IRF_ITERATIONS = 300
 DEFAULT_REGULARIZATION = 0
 DEFAULT_OVERWRITE = True
 
+
 class H5DataCalibrator:
     """
     Calibrate per-channel FLIM histograms stored in HDF5 files.
 
+    Parameters
+    ----------
+    data_path : str or path-like
+        HDF5 file containing the data to calibrate.
+    reference_path : str or path-like
+        HDF5 file containing the reference histogram or IRF source.
+    data_key : str or iterable of str, default ``("data", "data_channels_extra")``
+        Dataset key or keys to calibrate in ``data_path``. When ``None``, the
+        class falls back to ``DEFAULT_DATA_KEYS``.
+    reference_key : None, str, iterable of str, or dict, default ``None``
+        Dataset key selection for the reference file. If ``None``, each data
+        key is mapped to itself. A single string is reused for all data keys, an
+        iterable can provide one key per data key, and a dict can map each data
+        key explicitly.
+    reference_type : {"ref", "irf"}, default ``"ref"``
+        Type of reference data. Aliases such as ``"reference"`` are normalized
+        internally to ``"ref"``.
+    tau_ref : float or None, default ``None``
+        Reference lifetime in ns. When ``None``, the reference lifetime is
+        estimated from the reference data when needed by the chosen fit mode.
+    fit_mode : str, default ``"model_shift"``
+        Fitting mode forwarded to the alignment routines.
+    fit_type : str, default ``"circular"``
+        Fit geometry forwarded to the alignment routines.
+    C_ref : float, default ``1.0``
+        Reference amplitude scaling factor.
+    output_path : str or path-like or None, default ``None``
+        Output HDF5 path. When ``None``, a default calibrated output path is
+        derived from ``data_path``.
+    overwrite : bool, default ``True``
+        If ``True``, overwrite an existing output file.
+    channels : iterable of int or None, default ``None``
+        Optional subset of channel indices to calibrate. When ``None``, all
+        available channels are processed.
+    calibration_key : str, default ``"calibration"``
+        Group name used to store calibration outputs in the destination file.
+    period_ns : float or None, default ``None``
+        Laser period in ns. When ``None``, the value is inferred from metadata
+        when possible.
+    initial_tau : float or None, default ``None``
+        Optional initial guess for the lifetime fit.
+    initial_dT : float or None, default ``None``
+        Optional initial guess for the temporal shift fit.
+    initial_C : float or None, default ``None``
+        Optional initial guess for the amplitude fit.
+    force_C_normalized : bool, default ``False``
+        If ``True``, force the fitted amplitude term to remain normalized.
+    irf_iterations : int, default ``300``
+        Number of iterations used when estimating the IRF from the reference
+        data.
+    eps : float, default ``1e-8``
+        Numerical stability constant passed to the fitting routines.
+    regularization : float, default ``0``
+        Regularization strength used during IRF estimation.
+
+    Notes
+    -----
     The input datasets are expected to have shape
     ``[repetition, z, y, x, t, ch]``. Only one channel histogram at a time is
     materialized in memory, so the whole 6D dataset is never converted to a
@@ -750,7 +808,51 @@ def calibrate_h5_file(
     **kwargs,
 ):
     """
-    Convenience wrapper for :class:`H5DataCalibrator`.
+    Calibrate an HDF5 FLIM file against a reference file.
+
+    This is a convenience wrapper around :class:`H5DataCalibrator` that exposes
+    the most commonly used calibration parameters directly and forwards any
+    extra keyword arguments to the class constructor.
+
+    Parameters
+    ----------
+    data_path : str or path-like
+        HDF5 file containing the data to calibrate.
+    reference_path : str or path-like
+        HDF5 file containing the reference histogram or IRF source.
+    data_key : str or iterable of str, default ``("data", "data_channels_extra")``
+        Dataset key or keys to calibrate from ``data_path``.
+    reference_key : str or iterable of str or dict, default ``("data", "data_channels_extra")``
+        Dataset key or keys to read from ``reference_path``. A dict can also be
+        used to map each data key to a different reference key.
+    reference_type : {"ref", "irf"}, default ``"ref"``
+        Type of reference input used during calibration.
+    tau_ref : float or None, default ``None``
+        Reference lifetime in ns. If ``None``, it is estimated from the
+        reference data when needed.
+    fit_mode : str, default ``"model_shift"``
+        Fitting mode forwarded to the alignment routines.
+    fit_type : str, default ``"circular"``
+        Fit geometry forwarded to the alignment routines.
+    C_ref : float, default ``1.0``
+        Reference amplitude scaling factor.
+    irf_iterations : int, default ``300``
+        Number of iterations used when estimating the IRF.
+    regularization : float, default ``0``
+        Regularization strength used during IRF estimation.
+    overwrite : bool, default ``True``
+        If ``True``, overwrite an existing output file.
+    **kwargs
+        Additional keyword arguments forwarded to
+        :class:`H5DataCalibrator`, including ``output_path=None``,
+        ``channels=None``, ``calibration_key="calibration"``,
+        ``period_ns=None``, ``initial_tau=None``, ``initial_dT=None``,
+        ``initial_C=None``, ``force_C_normalized=False``, and ``eps=1e-8``.
+
+    Returns
+    -------
+    str
+        Path to the calibrated output HDF5 file.
     """
     return H5DataCalibrator(
         data_path,
