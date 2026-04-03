@@ -3,7 +3,11 @@ BrightEyes-FLIM
 
 ## Installation
 
-You can install `brighteyes-flim` via [pip] directly from GitHub:
+Install `brighteyes-flim` from PyPI:
+
+    pip install brighteyes-flim
+
+You can also install the latest development version directly from GitHub:
 
     pip install git+https://github.com/VicidominiLab/BrightEyes-Flim
 

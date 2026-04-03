@@ -1,5 +1,7 @@
 build/
 dist/
+src/*.egg-info/
+src/**/__pycache__/
 brighteyes_flim/__pycache__/
 brighteyes_flim/*/__pycache__/
 brighteyes_flim.egg-info/
