@@ -2,6 +2,7 @@ from matplotlib import colors
 import json
 import numpy as np
 from pathlib import Path
+import warnings
 from matplotlib.pyplot import gca
 from matplotlib.colors import hsv_to_rgb
 from mpl_toolkits.axes_grid1 import make_axes_locatable
@@ -40,7 +41,7 @@ class H5DataCalibrator:
     NumPy array up front.
     """
 
-    DEFAULT_DATA_KEYS = ("data",)
+    DEFAULT_DATA_KEYS = ("data", "data_extra",)
 
     def __init__(
         self,
@@ -68,8 +69,8 @@ class H5DataCalibrator:
     ):
         self.data_path = Path(data_path)
         self.reference_path = Path(reference_path)
-        self.data_key = data_key
-        self.reference_key = reference_key if reference_key is not None else data_key
+        self.data_keys = self._normalize_key_sequence(data_key, "data_key")
+        self.reference_key_map = self._normalize_reference_keys(reference_key, self.data_keys)
         self.reference_type = self._normalize_reference_type(reference_type)
         self.tau_ref = tau_ref
         self.fit_mode = fit_mode
@@ -87,6 +88,58 @@ class H5DataCalibrator:
         self.irf_iterations = irf_iterations
         self.eps = eps
         self.regularization = regularization
+
+    @classmethod
+    def _normalize_key_sequence(cls, keys, param_name):
+        if keys is None:
+            keys = cls.DEFAULT_DATA_KEYS
+
+        if isinstance(keys, (str, Path)):
+            normalized = [str(keys)]
+        else:
+            try:
+                normalized = [str(key) for key in keys]
+            except TypeError as exc:
+                raise TypeError(f"{param_name} must be a string or an iterable of strings") from exc
+
+        normalized = [key for key in normalized if key]
+        if not normalized:
+            raise ValueError(f"{param_name} must contain at least one dataset key")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError(f"{param_name} must not contain duplicates")
+        return normalized
+
+    @staticmethod
+    def _normalize_reference_keys(reference_key, data_keys):
+        if reference_key is None:
+            return {data_key: data_key for data_key in data_keys}
+
+        if isinstance(reference_key, dict):
+            mapping = {}
+            for data_key in data_keys:
+                if data_key not in reference_key:
+                    raise KeyError(f"missing reference_key entry for data key {data_key!r}")
+                mapping[data_key] = str(reference_key[data_key])
+            return mapping
+
+        if isinstance(reference_key, (str, Path)):
+            reference_key_str = str(reference_key)
+            return {data_key: reference_key_str for data_key in data_keys}
+
+        try:
+            reference_keys = [str(key) for key in reference_key]
+        except TypeError as exc:
+            raise TypeError(
+                "reference_key must be None, a string, a mapping, or an iterable of strings"
+            ) from exc
+
+        if len(reference_keys) == 1:
+            return {data_key: reference_keys[0] for data_key in data_keys}
+        if len(reference_keys) != len(data_keys):
+            raise ValueError(
+                "reference_key iterable must have length 1 or match the number of data keys"
+            )
+        return {data_key: ref_key for data_key, ref_key in zip(data_keys, reference_keys)}
 
     @staticmethod
     def _normalize_reference_type(reference_type):
@@ -312,6 +365,27 @@ class H5DataCalibrator:
         except (TypeError, ValueError):
             return str(tau_ref)
 
+    @staticmethod
+    def _empty_fit_payload(nbin, reference_type, data_histogram, reference_histogram, irf_source):
+        zero_hist = np.zeros(int(nbin), dtype=float)
+        payload = {
+            "C": np.nan,
+            "tau": np.nan,
+            "tau_ref": np.nan,
+            "dT": np.nan,
+            "dT_ns": np.nan,
+            "cov": np.full((3, 3), np.nan, dtype=float),
+            "data_histogram": np.asarray(data_histogram, dtype=float),
+            "irf": zero_hist.copy(),
+            "irf_calibrated": zero_hist.copy(),
+            "fit": zero_hist.copy(),
+            "irf_source": str(irf_source),
+        }
+        if reference_type == "ref":
+            payload["ref_original"] = np.asarray(reference_histogram, dtype=float)
+            payload["ref_calibrated"] = zero_hist.copy()
+        return payload
+
     def _prepare_output_file(self):
         if self.output_path.resolve() == self.data_path.resolve():
             raise ValueError("output_path must be different from data_path")
@@ -322,6 +396,13 @@ class H5DataCalibrator:
         shutil.copy2(self.data_path, self.output_path)
         return self.output_path
 
+    def _get_target_group(self, calibration_group, data_key):
+        if len(self.data_keys) == 1:
+            return calibration_group
+        if data_key in calibration_group:
+            del calibration_group[data_key]
+        return calibration_group.create_group(data_key)
+
     def calibrate(self):
         data_metadata = mcs.metadata_load(str(self.data_path))
         reference_metadata = mcs.metadata_load(str(self.reference_path))
@@ -330,29 +411,6 @@ class H5DataCalibrator:
         with h5py.File(self.data_path, "r") as data_handle, \
              h5py.File(self.reference_path, "r") as reference_handle, \
              h5py.File(output_path, "a") as output_handle:
-
-            data_dataset = self._open_dataset(data_handle, self.data_key)
-            reference_dataset = self._open_dataset(reference_handle, self.reference_key)
-
-            self._validate_dataset_layout(data_dataset, "data")
-            self._validate_dataset_layout(reference_dataset, "reference")
-
-            if data_dataset.shape[-2] != reference_dataset.shape[-2]:
-                raise ValueError(
-                    "data and reference datasets must have the same number of time bins "
-                    f"(got {data_dataset.shape[-2]} and {reference_dataset.shape[-2]})"
-                )
-
-            channel_indices = self._resolve_channels(self.channels, int(data_dataset.shape[-1]))
-            reference_channel_map = self._resolve_reference_channel_map(data_dataset, reference_dataset)
-            if len(channel_indices) == 0:
-                raise ValueError("channels must contain at least one channel index")
-
-            nbin, dt_ns, period_ns, t_ns = self.build_time_axis(
-                data_metadata,
-                nbin=int(data_dataset.shape[-2]),
-                period_ns=self.period_ns,
-            )
 
             if self.calibration_key in output_handle:
                 del output_handle[self.calibration_key]
@@ -364,8 +422,8 @@ class H5DataCalibrator:
                     "source_data_file": str(self.data_path),
                     "source_reference_file": str(self.reference_path),
                     "output_file": str(output_path),
-                    "data_key": self.data_key,
-                    "reference_key": self.reference_key,
+                    "data_keys": json.dumps(self.data_keys),
+                    "reference_keys": json.dumps(self.reference_key_map),
                     "reference_type": self.reference_type,
                     "tau_ref_input": self._format_tau_ref_input(self.tau_ref),
                     "fit_mode": self.fit_mode,
@@ -378,171 +436,299 @@ class H5DataCalibrator:
                     "initial_dT": self.initial_dT,
                     "initial_C": self.initial_C,
                     "force_C_normalized": self.force_C_normalized,
-                    "nbin": nbin,
-                    "dt_ns": dt_ns,
-                    "period_ns": period_ns,
-                    "channel_count": int(data_dataset.shape[-1]),
-                    "channel_count_calibrated": len(channel_indices),
-                    "data_shape": list(data_dataset.shape),
-                    "reference_shape": list(reference_dataset.shape),
+                    "data_key_count": len(self.data_keys),
                 },
             )
             self._write_metadata_group(calibration_group, "input_data_metadata", data_metadata)
             self._write_metadata_group(calibration_group, "input_reference_metadata", reference_metadata)
 
-            calibration_group.attrs["channel_axis"] = -1
-            calibration_group.attrs["stacked_histogram_layout"] = "(t, ch)"
-            calibration_group.attrs["stacked_covariance_layout"] = "(param, param, ch)"
+            data_key_iterator = tqdm(
+                self.data_keys,
+                desc="Calibrating data keys",
+                unit="key",
+                disable=len(self.data_keys) <= 1,
+            )
+            for data_key in data_key_iterator:
+                reference_key = self.reference_key_map[data_key]
+                data_dataset = self._open_dataset(data_handle, data_key)
+                reference_dataset = self._open_dataset(reference_handle, reference_key)
 
-            stacked_channel_index = []
-            stacked_reference_channel_index = []
-            stacked_C = []
-            stacked_tau = []
-            stacked_tau_ref = []
-            stacked_dT_bins = []
-            stacked_dT_ns = []
-            stacked_irf_source = []
-            stacked_covariance = []
-            stacked_data_histogram = []
-            stacked_data_histogram_normalized = []
-            stacked_irf_original = []
-            stacked_irf_calibrated = []
-            stacked_fit = []
-            stacked_ref_original = []
-            stacked_ref_calibrated = []
+                self._validate_dataset_layout(data_dataset, f"data[{data_key}]")
+                self._validate_dataset_layout(reference_dataset, f"reference[{reference_key}]")
 
-            for channel_index in channel_indices:
-                reference_channel_index = reference_channel_map[channel_index]
-                data_histogram = self._sum_histogram_for_channel(data_dataset, channel_index)
-                reference_histogram = self._sum_histogram_for_channel(reference_dataset, reference_channel_index)
+                if data_dataset.shape[-2] != reference_dataset.shape[-2]:
+                    raise ValueError(
+                        "data and reference datasets must have the same number of time bins "
+                        f"(got {data_dataset.shape[-2]} and {reference_dataset.shape[-2]}) "
+                        f"for data key {data_key!r}"
+                    )
 
-                fit_kwargs = {
-                    "t": t_ns,
-                    "data": data_histogram,
-                    "period": period_ns,
-                    "C_ref": self.C_ref,
-                    "irf_output": "original",
-                    "shift_output": "ref" if self.reference_type == "ref" else None,
-                    "fit_type": self.fit_type,
-                    "mode": self.fit_mode,
-                    "initial_tau": self.initial_tau,
-                    "initial_dT": self.initial_dT,
-                    "initial_C": self.initial_C,
-                    "force_C_normalized": self.force_C_normalized,
-                    "irf_iterations": self.irf_iterations,
-                    "eps": self.eps,
-                    "regularization": self.regularization,
-                }
+                channel_indices = self._resolve_channels(self.channels, int(data_dataset.shape[-1]))
+                reference_channel_map = self._resolve_reference_channel_map(data_dataset, reference_dataset)
+                if len(channel_indices) == 0:
+                    raise ValueError("channels must contain at least one channel index")
+
+                nbin, dt_ns, period_ns, t_ns = self.build_time_axis(
+                    data_metadata,
+                    nbin=int(data_dataset.shape[-2]),
+                    period_ns=self.period_ns,
+                )
+
+                target_group = self._get_target_group(calibration_group, data_key)
+                self._set_group_attrs(
+                    target_group,
+                    {
+                        "data_key": data_key,
+                        "reference_key": reference_key,
+                        "reference_type": self.reference_type,
+                        "tau_ref_input": self._format_tau_ref_input(self.tau_ref),
+                        "fit_mode": self.fit_mode,
+                        "fit_type": self.fit_type,
+                        "C_ref": self.C_ref,
+                        "irf_iterations": self.irf_iterations,
+                        "eps": self.eps,
+                        "regularization": self.regularization,
+                        "initial_tau": self.initial_tau,
+                        "initial_dT": self.initial_dT,
+                        "initial_C": self.initial_C,
+                        "force_C_normalized": self.force_C_normalized,
+                        "nbin": nbin,
+                        "dt_ns": dt_ns,
+                        "period_ns": period_ns,
+                        "channel_count": int(data_dataset.shape[-1]),
+                        "channel_count_calibrated": len(channel_indices),
+                        "data_shape": list(data_dataset.shape),
+                        "reference_shape": list(reference_dataset.shape),
+                        "channel_axis": -1,
+                        "stacked_histogram_layout": "(t, ch)",
+                        "stacked_covariance_layout": "(param, param, ch)",
+                    },
+                )
+
+                stacked_channel_index = []
+                stacked_reference_channel_index = []
+                stacked_C = []
+                stacked_tau = []
+                stacked_tau_ref = []
+                stacked_dT_bins = []
+                stacked_dT_ns = []
+                stacked_irf_source = []
+                stacked_covariance = []
+                stacked_data_histogram = []
+                stacked_irf_original = []
+                stacked_irf_calibrated = []
+                stacked_fit = []
+                stacked_ref_original = []
+                stacked_ref_calibrated = []
+
+                channel_iterator = tqdm(
+                    channel_indices,
+                    desc=f"Calibrating {data_key}",
+                    unit="ch",
+                    leave=False,
+                )
+                for channel_index in channel_iterator:
+                    reference_channel_index = reference_channel_map[channel_index]
+                    data_histogram = self._sum_histogram_for_channel(data_dataset, channel_index)
+                    reference_histogram = self._sum_histogram_for_channel(reference_dataset, reference_channel_index)
+                    data_sum = float(np.sum(data_histogram))
+                    reference_sum = float(np.sum(reference_histogram))
+
+                    if not np.isfinite(data_sum) or data_sum <= 0:
+                        warnings.warn(
+                            (
+                                f"Skipping calibration for data key {data_key!r}, channel {channel_index}: "
+                                "data histogram has a non-positive or non-finite sum"
+                            ),
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                        fit_payload = self._empty_fit_payload(
+                            nbin=nbin,
+                            reference_type=self.reference_type,
+                            data_histogram=data_histogram,
+                            reference_histogram=reference_histogram,
+                            irf_source="skipped_zero_sum_data",
+                        )
+                    elif not np.isfinite(reference_sum) or reference_sum <= 0:
+                        warnings.warn(
+                            (
+                                f"Skipping calibration for data key {data_key!r}, channel {channel_index}: "
+                                f"reference channel {reference_channel_index} histogram has a non-positive "
+                                "or non-finite sum"
+                            ),
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                        fit_payload = self._empty_fit_payload(
+                            nbin=nbin,
+                            reference_type=self.reference_type,
+                            data_histogram=data_histogram,
+                            reference_histogram=reference_histogram,
+                            irf_source="skipped_zero_sum_reference",
+                        )
+                    else:
+                        fit_kwargs = {
+                            "t": t_ns,
+                            "data": data_histogram,
+                            "period": period_ns,
+                            "C_ref": self.C_ref,
+                            "irf_output": "original",
+                            "shift_output": "ref" if self.reference_type == "ref" else None,
+                            "fit_type": self.fit_type,
+                            "mode": self.fit_mode,
+                            "initial_tau": self.initial_tau,
+                            "initial_dT": self.initial_dT,
+                            "initial_C": self.initial_C,
+                            "force_C_normalized": self.force_C_normalized,
+                            "irf_iterations": self.irf_iterations,
+                            "eps": self.eps,
+                            "regularization": self.regularization,
+                        }
+                        if self.reference_type == "ref":
+                            fit_kwargs["ref"] = reference_histogram
+                            fit_kwargs["tau_ref"] = self.tau_ref
+                        else:
+                            fit_kwargs["irf"] = reference_histogram
+
+                        try:
+                            fit_result = Alignment.fit_data_with_ref_or_irf(**fit_kwargs)
+                            irf_original = np.asarray(fit_result["irf"], dtype=float)
+                            irf_calibrated = Alignment._normalize_histogram_1d(
+                                Alignment.linear_shift(irf_original, fit_result["dT"], cyclic=True),
+                                name="irf_calibrated",
+                            )
+                            fit_payload = {
+                                "C": float(fit_result["C"]),
+                                "tau": float(fit_result["tau"]),
+                                "tau_ref": (
+                                    np.nan
+                                    if fit_result["tau_ref"] is None
+                                    else float(fit_result["tau_ref"])
+                                ),
+                                "dT": float(fit_result["dT"]),
+                                "dT_ns": float(fit_result["dT_ns"]),
+                                "cov": np.asarray(fit_result["cov"], dtype=float),
+                                "data_histogram": np.asarray(data_histogram, dtype=float),
+                                "irf": np.asarray(irf_original, dtype=float),
+                                "irf_calibrated": np.asarray(irf_calibrated, dtype=float),
+                                "fit": np.asarray(fit_result["fit"], dtype=float),
+                                "irf_source": str(fit_result["irf_source"]),
+                            }
+                            if self.reference_type == "ref":
+                                fit_payload["ref_original"] = np.asarray(reference_histogram, dtype=float)
+                                fit_payload["ref_calibrated"] = np.asarray(
+                                    fit_result["ref_shifted"],
+                                    dtype=float,
+                                )
+                        except Exception as exc:
+                            warnings.warn(
+                                (
+                                    f"Calibration fit failed for data key {data_key!r}, channel "
+                                    f"{channel_index}: {exc}"
+                                ),
+                                RuntimeWarning,
+                                stacklevel=2,
+                            )
+                            fit_payload = self._empty_fit_payload(
+                                nbin=nbin,
+                                reference_type=self.reference_type,
+                                data_histogram=data_histogram,
+                                reference_histogram=reference_histogram,
+                                irf_source="fit_failed",
+                            )
+
+                    stacked_channel_index.append(channel_index)
+                    stacked_reference_channel_index.append(reference_channel_index)
+                    stacked_C.append(float(fit_payload["C"]))
+                    stacked_tau.append(float(fit_payload["tau"]))
+                    stacked_tau_ref.append(float(fit_payload["tau_ref"]))
+                    stacked_dT_bins.append(float(fit_payload["dT"]))
+                    stacked_dT_ns.append(float(fit_payload["dT_ns"]))
+                    stacked_irf_source.append(str(fit_payload["irf_source"]))
+                    stacked_covariance.append(np.asarray(fit_payload["cov"], dtype=float))
+                    stacked_data_histogram.append(np.asarray(fit_payload["data_histogram"], dtype=float))
+                    stacked_irf_original.append(np.asarray(fit_payload["irf"], dtype=float))
+                    stacked_irf_calibrated.append(np.asarray(fit_payload["irf_calibrated"], dtype=float))
+                    stacked_fit.append(np.asarray(fit_payload["fit"], dtype=float))
+                    if self.reference_type == "ref":
+                        stacked_ref_original.append(np.asarray(fit_payload["ref_original"], dtype=float))
+                        stacked_ref_calibrated.append(
+                            np.asarray(fit_payload["ref_calibrated"], dtype=float)
+                        )
+
+                self._replace_dataset(
+                    target_group,
+                    "channel_index",
+                    np.asarray(stacked_channel_index, dtype=int),
+                )
+                self._replace_dataset(
+                    target_group,
+                    "reference_channel_index",
+                    np.asarray(stacked_reference_channel_index, dtype=int),
+                )
+                self._replace_dataset(target_group, "C", np.asarray(stacked_C, dtype=float))
+                self._replace_dataset(target_group, "tau_ns", np.asarray(stacked_tau, dtype=float))
+                self._replace_dataset(target_group, "tau_ref_ns", np.asarray(stacked_tau_ref, dtype=float))
+                self._replace_dataset(
+                    target_group,
+                    "delta_t_correction_bins",
+                    np.asarray(stacked_dT_bins, dtype=float),
+                )
+                self._replace_dataset(
+                    target_group,
+                    "delta_t_correction_ns",
+                    np.asarray(stacked_dT_ns, dtype=float),
+                )
+                self._replace_dataset(
+                    target_group,
+                    "covariance",
+                    np.stack(stacked_covariance, axis=-1),
+                )
+                self._replace_dataset(
+                    target_group,
+                    "data_histogram",
+                    np.stack(stacked_data_histogram, axis=-1),
+                )
+                self._replace_dataset(
+                    target_group,
+                    "irf_original",
+                    np.stack(stacked_irf_original, axis=-1),
+                )
+                self._replace_dataset(
+                    target_group,
+                    "irf_calibrated",
+                    np.stack(stacked_irf_calibrated, axis=-1),
+                )
+                self._replace_dataset(
+                    target_group,
+                    "fit",
+                    np.stack(stacked_fit, axis=-1),
+                )
                 if self.reference_type == "ref":
-                    fit_kwargs["ref"] = reference_histogram
-                    fit_kwargs["tau_ref"] = self.tau_ref
+                    self._replace_dataset(
+                        target_group,
+                        "ref_original",
+                        np.stack(stacked_ref_original, axis=-1),
+                    )
+                    self._replace_dataset(
+                        target_group,
+                        "ref_calibrated",
+                        np.stack(stacked_ref_calibrated, axis=-1),
+                    )
+                string_dtype = h5py.string_dtype(encoding="utf-8")
+                if "irf_source" in target_group:
+                    del target_group["irf_source"]
+                target_group.create_dataset(
+                    "irf_source",
+                    data=np.asarray(stacked_irf_source, dtype=object),
+                    dtype=string_dtype,
+                )
+
+                if len(self.data_keys) == 1:
+                    target_group.attrs["data_key_group_mode"] = "flat_root"
                 else:
-                    fit_kwargs["irf"] = reference_histogram
-
-                fit_result = Alignment.fit_data_with_ref_or_irf(**fit_kwargs)
-
-                irf_original = np.asarray(fit_result["irf"], dtype=float)
-                irf_calibrated = Alignment._normalize_histogram_1d(
-                    Alignment.linear_shift(irf_original, fit_result["dT"], cyclic=True),
-                    name="irf_calibrated",
-                )
-                data_histogram_normalized = Alignment._normalize_histogram_1d(
-                    data_histogram,
-                    name="data_histogram",
-                )
-
-                stacked_channel_index.append(channel_index)
-                stacked_reference_channel_index.append(reference_channel_index)
-                stacked_C.append(float(fit_result["C"]))
-                stacked_tau.append(float(fit_result["tau"]))
-                stacked_tau_ref.append(
-                    np.nan if fit_result["tau_ref"] is None else float(fit_result["tau_ref"])
-                )
-                stacked_dT_bins.append(float(fit_result["dT"]))
-                stacked_dT_ns.append(float(fit_result["dT_ns"]))
-                stacked_irf_source.append(str(fit_result["irf_source"]))
-                stacked_covariance.append(np.asarray(fit_result["cov"], dtype=float))
-                stacked_data_histogram.append(np.asarray(data_histogram, dtype=float))
-                stacked_data_histogram_normalized.append(np.asarray(data_histogram_normalized, dtype=float))
-                stacked_irf_original.append(np.asarray(irf_original, dtype=float))
-                stacked_irf_calibrated.append(np.asarray(irf_calibrated, dtype=float))
-                stacked_fit.append(np.asarray(fit_result["fit"], dtype=float))
-                if self.reference_type == "ref":
-                    stacked_ref_original.append(np.asarray(reference_histogram, dtype=float))
-                    stacked_ref_calibrated.append(np.asarray(fit_result["ref_shifted"], dtype=float))
-
-            self._replace_dataset(
-                calibration_group,
-                "channel_index",
-                np.asarray(stacked_channel_index, dtype=int),
-            )
-            self._replace_dataset(
-                calibration_group,
-                "reference_channel_index",
-                np.asarray(stacked_reference_channel_index, dtype=int),
-            )
-            self._replace_dataset(calibration_group, "C", np.asarray(stacked_C, dtype=float))
-            self._replace_dataset(calibration_group, "tau_ns", np.asarray(stacked_tau, dtype=float))
-            self._replace_dataset(calibration_group, "tau_ref_ns", np.asarray(stacked_tau_ref, dtype=float))
-            self._replace_dataset(
-                calibration_group,
-                "delta_t_correction_bins",
-                np.asarray(stacked_dT_bins, dtype=float),
-            )
-            self._replace_dataset(
-                calibration_group,
-                "delta_t_correction_ns",
-                np.asarray(stacked_dT_ns, dtype=float),
-            )
-            self._replace_dataset(
-                calibration_group,
-                "covariance",
-                np.stack(stacked_covariance, axis=-1),
-            )
-            self._replace_dataset(
-                calibration_group,
-                "data_histogram",
-                np.stack(stacked_data_histogram, axis=-1),
-            )
-            self._replace_dataset(
-                calibration_group,
-                "data_histogram_normalized",
-                np.stack(stacked_data_histogram_normalized, axis=-1),
-            )
-            self._replace_dataset(
-                calibration_group,
-                "irf_original",
-                np.stack(stacked_irf_original, axis=-1),
-            )
-            self._replace_dataset(
-                calibration_group,
-                "irf_calibrated",
-                np.stack(stacked_irf_calibrated, axis=-1),
-            )
-            self._replace_dataset(
-                calibration_group,
-                "fit",
-                np.stack(stacked_fit, axis=-1),
-            )
-            if self.reference_type == "ref":
-                self._replace_dataset(
-                    calibration_group,
-                    "ref_original",
-                    np.stack(stacked_ref_original, axis=-1),
-                )
-                self._replace_dataset(
-                    calibration_group,
-                    "ref_calibrated",
-                    np.stack(stacked_ref_calibrated, axis=-1),
-                )
-            string_dtype = h5py.string_dtype(encoding="utf-8")
-            if "irf_source" in calibration_group:
-                del calibration_group["irf_source"]
-            calibration_group.create_dataset(
-                "irf_source",
-                data=np.asarray(stacked_irf_source, dtype=object),
-                dtype=string_dtype,
-            )
+                    target_group.attrs["data_key_group_mode"] = "nested_under_calibration"
 
         return str(output_path)
 
@@ -552,6 +738,51 @@ def calibrate_h5_file(data_path, reference_path, **kwargs):
     Convenience wrapper for :class:`H5DataCalibrator`.
     """
     return H5DataCalibrator(data_path, reference_path, **kwargs).calibrate()
+
+
+def show_h5_structure(file_path, include_attrs=True):
+    """
+    Return and print a readable tree view of an HDF5 file structure.
+
+    Parameters
+    ----------
+    file_path : str or path-like
+        HDF5 file to inspect.
+    include_attrs : bool, default True
+        If ``True``, include group and dataset attributes in the output.
+    """
+    lines = []
+
+    def append_attrs(node, level):
+        if not include_attrs:
+            return
+        for key, value in node.attrs.items():
+            lines.append(f"{'  ' * level}@{key} = {value!r}")
+
+    def visit(name, obj):
+        if name == "":
+            lines.append("/")
+            append_attrs(obj, 1)
+            return
+
+        level = name.count("/")
+        prefix = "  " * level
+        if isinstance(obj, h5py.Group):
+            lines.append(f"{prefix}{name.split('/')[-1]}/")
+            append_attrs(obj, level + 1)
+        elif isinstance(obj, h5py.Dataset):
+            lines.append(
+                f"{prefix}{name.split('/')[-1]} shape={obj.shape} dtype={obj.dtype}"
+            )
+            append_attrs(obj, level + 1)
+
+    with h5py.File(file_path, "r") as handle:
+        visit("", handle)
+        handle.visititems(visit)
+
+    structure = "\n".join(lines)
+    print(structure)
+    return structure
 
 
 class FlimData:
@@ -787,8 +1018,13 @@ class Alignment:
     def _normalize_histogram_1d(x, name="histogram"):
         hist = Alignment.to_numpy_1d(x, dtype=float)
         total = hist.sum()
-        if total <= 0:
-            raise ValueError(f"{name} must have a positive sum")
+        if not np.isfinite(total) or total <= 0:
+            warnings.warn(
+                f"{name} has a non-positive or non-finite sum; returning zeros without normalization",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return np.zeros_like(hist, dtype=float)
         return hist / total
 
     @staticmethod
@@ -1389,8 +1625,6 @@ class Alignment:
             irf_hist = Alignment.to_numpy_1d(irf, dtype=float)
             if len(irf_hist) != len(t_ns):
                 raise ValueError("t and irf must have the same 1D length")
-            if tau_ref is not None:
-                print("tau_ref ignored because irf was provided directly")
             irf_source = "provided"
 
         irf_hist_norm = Alignment._normalize_histogram_1d(irf_hist, name="irf")
@@ -1410,29 +1644,36 @@ class Alignment:
 
         dT_bins = float(fit_result["dT"])
         tau_ns = float(fit_result["tau"])
+        C_value = float(fit_result["C"])
+        fit_is_valid = np.isfinite(C_value) and np.isfinite(dT_bins) and np.isfinite(tau_ns)
 
         returned_irf = irf_hist_norm.copy()
-        if irf_output == "shifted":
+        if irf_output == "shifted" and fit_is_valid:
             returned_irf = Alignment._normalize_histogram_1d(
                 Alignment.linear_shift(returned_irf, dT_bins, cyclic=True),
                 name="shifted irf",
             )
+        elif irf_output == "shifted":
+            returned_irf = np.zeros_like(irf_hist_norm, dtype=float)
 
-        fitted_hist = Alignment._normalize_histogram_1d(
-            Alignment.fit_model_data(
-                t_ns,
-                fit_result["C"],
-                fit_result["dT"],
-                fit_result["tau"],
-                irf=irf_hist_norm,
-                period=period_ns,
-                mode=mode,
-            ),
-            name="fit",
-        )
+        if fit_is_valid:
+            fitted_hist = Alignment._normalize_histogram_1d(
+                Alignment.fit_model_data(
+                    t_ns,
+                    C_value,
+                    dT_bins,
+                    tau_ns,
+                    irf=irf_hist_norm,
+                    period=period_ns,
+                    mode=mode,
+                ),
+                name="fit",
+            )
+        else:
+            fitted_hist = np.zeros_like(data_hist_norm, dtype=float)
 
         result = {
-            "C": float(fit_result["C"]),
+            "C": C_value,
             "tau_ref": used_tau_ref_ns,
             "dT": dT_bins,
             "dT_ns": dT_bins * dt_ns,
@@ -1446,15 +1687,21 @@ class Alignment:
         if shift_output == "ref":
             if ref_hist_norm is None:
                 raise ValueError("shift_output='ref' requires ref to be provided")
-            result["ref_shifted"] = Alignment._normalize_histogram_1d(
-                Alignment.linear_shift(ref_hist_norm, dT_bins, cyclic=True),
-                name="shifted ref",
-            )
+            if fit_is_valid:
+                result["ref_shifted"] = Alignment._normalize_histogram_1d(
+                    Alignment.linear_shift(ref_hist_norm, dT_bins, cyclic=True),
+                    name="shifted ref",
+                )
+            else:
+                result["ref_shifted"] = np.zeros_like(ref_hist_norm, dtype=float)
         elif shift_output == "data":
-            result["data_shifted"] = Alignment._normalize_histogram_1d(
-                Alignment.linear_shift(data_hist_norm, -dT_bins, cyclic=True),
-                name="shifted data",
-            )
+            if fit_is_valid:
+                result["data_shifted"] = Alignment._normalize_histogram_1d(
+                    Alignment.linear_shift(data_hist_norm, -dT_bins, cyclic=True),
+                    name="shifted data",
+                )
+            else:
+                result["data_shifted"] = np.zeros_like(data_hist_norm, dtype=float)
 
         return result
 
@@ -1568,11 +1815,28 @@ class Alignment:
         data_sum = data_hist.sum()
         irf_sum = irf_hist.sum()
 
-        if data_sum <= 0:
-            raise ValueError("data must contain at least one positive value")
-            data_max = 1.0  # avoid division by zero, though the fit will likely fail with non-positive data
-        if irf_sum <= 0:
-            raise ValueError("irf must have a positive sum")
+        if not np.isfinite(data_sum) or data_sum <= 0:
+            warnings.warn(
+                "data histogram has a non-positive or non-finite sum; skipping fit and returning NaNs",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return {
+                "C": np.nan,
+                "dT": np.nan,
+                "tau": np.nan,
+            }, np.full((3, 3), np.nan, dtype=float)
+        if not np.isfinite(irf_sum) or irf_sum <= 0:
+            warnings.warn(
+                "irf histogram has a non-positive or non-finite sum; skipping fit and returning NaNs",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return {
+                "C": np.nan,
+                "dT": np.nan,
+                "tau": np.nan,
+            }, np.full((3, 3), np.nan, dtype=float)
 
         data_hist_norm = data_hist / data_sum
         irf_hist_norm = irf_hist / irf_sum
@@ -1633,10 +1897,6 @@ class Alignment:
             fit_bounds_fixed_c = ([-nbin / 2, tau_lower_bound], [nbin / 2, t_ns.max()])
 
             if fit_type == "circular":
-                print("Using circular fit with curve_fit_circular and C fixed to 1.0")
-                print("initial_guess", initial_guess_fixed_c)
-                print("bounds", fit_bounds_fixed_c)
-                print("circular_params", {0: float(nbin)})
                 popt_fixed_c, conv_fixed_c = Alignment.curve_fit_circular(
                     fit_lambda_fixed_c,
                     t_ns,
@@ -1649,9 +1909,6 @@ class Alignment:
                     maxfev=600000,
                 )
             elif fit_type == "curve_fit":
-                print("Using standard curve_fit with C fixed to 1.0")
-                print("initial_guess", initial_guess_fixed_c)
-                print("bounds", fit_bounds_fixed_c)
                 popt_fixed_c, conv_fixed_c = scipy_optimize.curve_fit(
                     fit_lambda_fixed_c,
                     t_ns,
@@ -1671,10 +1928,6 @@ class Alignment:
             fit_bounds = ([0.0, -nbin / 2, tau_lower_bound], [np.inf, nbin / 2, t_ns.max()])
 
             if fit_type == "circular":
-                print("Using circular fit with curve_fit_circular")
-                print("initial_guess", initial_guess)
-                print("bounds", fit_bounds)
-                print("circular_params", {1: float(nbin)})
                 popt, conv = Alignment.curve_fit_circular(
                     fit_lambda_numpy,
                     t_ns,
@@ -1686,9 +1939,6 @@ class Alignment:
                     maxfev=600000,
                 )
             elif fit_type == "curve_fit":
-                print("Using standard curve_fit")
-                print("initial_guess", initial_guess)
-                print("bounds", fit_bounds)
                 popt, conv = scipy_optimize.curve_fit(
                     fit_lambda_numpy,
                     t_ns,
