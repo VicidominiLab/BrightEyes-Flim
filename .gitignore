@@ -8,6 +8,9 @@ brighteyes_flim.egg-info/
 brighteyes_flim.egg-info/*
 venv
 .*
+!.github/
+!.github/workflows/
+!.github/workflows/*.yml
 *.pyc
 *.pyo
 .idea/
