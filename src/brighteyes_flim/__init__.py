@@ -4,7 +4,8 @@ from .flism import (Alignment,
                     estimate_lifetime_from_birfi,
                     estimate_lifetime_from_circmean,
                     estimate_lifetime_from_log,
-                    show_h5_structure)
+                    show_h5_structure,
+                    show_h5_structure_html)
 from brighteyes_ism.dataio import mcs
 
 
@@ -39,4 +40,5 @@ __all__ = [
     "estimate_lifetime_from_log",
     "estimate_lifetime_from_circmean",
     "show_h5_structure",
+    "show_h5_structure_html",
 ]

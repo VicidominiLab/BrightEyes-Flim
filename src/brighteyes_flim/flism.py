@@ -1,4 +1,5 @@
 from matplotlib import colors
+from html import escape
 import json
 import numpy as np
 from pathlib import Path
@@ -740,7 +741,7 @@ def calibrate_h5_file(data_path, reference_path, **kwargs):
     return H5DataCalibrator(data_path, reference_path, **kwargs).calibrate()
 
 
-def show_h5_structure(file_path, include_attrs=True):
+def show_h5_structure(file_path, include_attrs=True, attrs_inline=False):
     """
     Return and print a readable tree view of an HDF5 file structure.
 
@@ -750,14 +751,26 @@ def show_h5_structure(file_path, include_attrs=True):
         HDF5 file to inspect.
     include_attrs : bool, default True
         If ``True``, include group and dataset attributes in the output.
+    attrs_inline : bool, default False
+        If ``True``, print attributes as indented ``.attrs.<name> = value``
+        lines directly below each group or dataset.
     """
     lines = []
 
-    def append_attrs(node, level):
+    def append_attrs(node, level, node_name=None):
         if not include_attrs:
             return
-        for key, value in node.attrs.items():
-            lines.append(f"{'  ' * level}@{key} = {value!r}")
+        attrs_items = list(node.attrs.items())
+        if not attrs_items:
+            return
+        indent = "  " * level
+        if attrs_inline:
+            prefix = f"{node_name}.attrs" if node_name else ".attrs"
+            joined = ", ".join(f"{key}={value!r}" for key, value in attrs_items)
+            lines.append(f"{indent}{prefix}: {joined}")
+            return
+        for key, value in attrs_items:
+            lines.append(f"{indent}@{key} = {value!r}")
 
     def visit(name, obj):
         if name == "":
@@ -767,14 +780,15 @@ def show_h5_structure(file_path, include_attrs=True):
 
         level = name.count("/")
         prefix = "  " * level
+        node_name = name.split("/")[-1]
         if isinstance(obj, h5py.Group):
-            lines.append(f"{prefix}{name.split('/')[-1]}/")
-            append_attrs(obj, level + 1)
+            lines.append(f"{prefix}{node_name}/")
+            append_attrs(obj, level + 1, node_name=node_name)
         elif isinstance(obj, h5py.Dataset):
             lines.append(
-                f"{prefix}{name.split('/')[-1]} shape={obj.shape} dtype={obj.dtype}"
+                f"{prefix}{node_name} shape={obj.shape} dtype={obj.dtype}"
             )
-            append_attrs(obj, level + 1)
+            append_attrs(obj, level + 1, node_name=node_name)
 
     with h5py.File(file_path, "r") as handle:
         visit("", handle)
@@ -783,6 +797,163 @@ def show_h5_structure(file_path, include_attrs=True):
     structure = "\n".join(lines)
     print(structure)
     return structure
+
+
+def show_h5_structure_html(file_path, include_attrs=True, attrs_inline=True, display_output=True):
+    """
+    Return an HTML tree view of an HDF5 file structure.
+
+    Parameters
+    ----------
+    file_path : str or path-like
+        HDF5 file to inspect.
+    include_attrs : bool, default True
+        If ``True``, include group and dataset attributes in the output.
+    attrs_inline : bool, default True
+        If ``True``, render all attributes for a node on one line.
+    display_output : bool, default True
+        If ``True`` and IPython is available, display the HTML immediately.
+    """
+
+    def format_value(value):
+        return escape(repr(value))
+
+    def render_attrs(node, node_name):
+        if not include_attrs or len(node.attrs) == 0:
+            return ""
+
+        items = list(node.attrs.items())
+        if attrs_inline:
+            joined = ", ".join(
+                f"<span class='h5-attr-key'>{escape(str(key))}</span>="
+                f"<span class='h5-attr-value'>{format_value(value)}</span>"
+                for key, value in items
+            )
+            return (
+                f"<div class='h5-attrs-inline'>"
+                f"<span class='h5-attrs-prefix'>"
+                f"<span class='h5-node-ref'>{escape(node_name)}.attrs</span>:"
+                f"</span>"
+                f"<span class='h5-attrs-content'>{joined}</span>"
+                f"</div>"
+            )
+
+        parts = ["<ul class='h5-attrs-list'>"]
+        for key, value in items:
+            parts.append(
+                "<li>"
+                f"<span class='h5-node-ref'>{escape(node_name)}.attrs.</span>"
+                f"<span class='h5-attr-key'>{escape(str(key))}</span>"
+                f" = <span class='h5-attr-value'>{format_value(value)}</span>"
+                "</li>"
+            )
+        parts.append("</ul>")
+        return "".join(parts)
+
+    def render_node(name, obj):
+        node_name = name.split("/")[-1] if name else "/"
+        if isinstance(obj, h5py.Dataset):
+            label = (
+                f"<span class='h5-dataset'>{escape(node_name)}</span> "
+                f"<span class='h5-meta'>shape={escape(str(obj.shape))} "
+                f"dtype={escape(str(obj.dtype))}</span>"
+            )
+            attrs_html = render_attrs(obj, node_name)
+            return f"<li>{label}{attrs_html}</li>"
+
+        label = f"<span class='h5-group'>{escape(node_name)}</span>/"
+        attrs_html = render_attrs(obj, node_name)
+        children = []
+        for child_name in obj.keys():
+            children.append(render_node(child_name, obj[child_name]))
+        children_html = ""
+        if children:
+            children_html = f"<ul>{''.join(children)}</ul>"
+        return f"<li>{label}{attrs_html}{children_html}</li>"
+
+    with h5py.File(file_path, "r") as handle:
+        children = [render_node(name, handle[name]) for name in handle.keys()]
+        root_attrs_html = render_attrs(handle, "/")
+
+    html_output = f"""
+<div class="h5-tree">
+  <style>
+    .h5-tree {{
+      font-family: "Menlo", "Consolas", "DejaVu Sans Mono", monospace;
+      font-size: 13px;
+      line-height: 1.5;
+      color: #1f2937;
+    }}
+    .h5-tree ul {{
+      list-style: none;
+      margin: 0.2rem 0 0.2rem 1.1rem;
+      padding-left: 1rem;
+      border-left: 1px solid #d1d5db;
+    }}
+    .h5-tree li {{
+      margin: 0.2rem 0;
+    }}
+    .h5-group {{
+      color: #0f766e;
+      font-weight: 700;
+    }}
+    .h5-dataset {{
+      color: #1d4ed8;
+      font-weight: 700;
+    }}
+    .h5-meta {{
+      color: #6b7280;
+      font-weight: 500;
+    }}
+    .h5-attrs-inline, .h5-attrs-list {{
+      margin-top: 0.15rem;
+      color: #7c2d12;
+    }}
+    .h5-attrs-inline {{
+      display: grid;
+      grid-template-columns: max-content 1fr;
+      column-gap: 0.45rem;
+      align-items: start;
+    }}
+    .h5-attrs-prefix {{
+      white-space: nowrap;
+    }}
+    .h5-attrs-content {{
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }}
+    .h5-node-ref {{
+      color: #7c3aed;
+      font-weight: 700;
+    }}
+    .h5-attr-key {{
+      color: #b45309;
+      font-weight: 700;
+    }}
+    .h5-attr-value {{
+      color: #374151;
+    }}
+    .h5-root {{
+      color: #111827;
+      font-weight: 800;
+    }}
+  </style>
+  <div class="h5-root">/</div>
+  {root_attrs_html}
+  <ul>
+    {''.join(children)}
+  </ul>
+</div>
+""".strip()
+
+    if display_output:
+        try:
+            from IPython.display import HTML, display
+            display(HTML(html_output))
+        except ImportError:
+            pass
+
+    return html_output
 
 
 class FlimData:
