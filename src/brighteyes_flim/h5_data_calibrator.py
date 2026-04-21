@@ -1005,7 +1005,15 @@ def show_h5_structure_html(file_path, include_attrs=True, attrs_inline=True, dis
         children_html = ""
         if children:
             children_html = f"<ul>{''.join(children)}</ul>"
-        return f"<li>{label}{attrs_html}{children_html}</li>"
+        return (
+            "<li>"
+            "<details class='h5-branch' open>"
+            f"<summary>{label}</summary>"
+            f"{attrs_html}"
+            f"{children_html}"
+            "</details>"
+            "</li>"
+        )
 
     with h5py.File(file_path, "r") as handle:
         children = [render_node(name, handle[name]) for name in handle.keys()]
@@ -1053,6 +1061,22 @@ def show_h5_structure_html(file_path, include_attrs=True, attrs_inline=True, dis
     }}
     .h5-tree li {{
       margin: 0.2rem 0;
+    }}
+    .h5-tree summary {{
+      cursor: pointer;
+      list-style: none;
+    }}
+    .h5-tree summary::-webkit-details-marker {{
+      display: none;
+    }}
+    .h5-branch > summary::before {{
+      content: "▾";
+      color: var(--h5-muted);
+      display: inline-block;
+      width: 1rem;
+    }}
+    .h5-branch:not([open]) > summary::before {{
+      content: "▸";
     }}
     .h5-group {{
       color: var(--h5-group);
