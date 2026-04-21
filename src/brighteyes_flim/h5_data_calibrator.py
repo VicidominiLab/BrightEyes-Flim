@@ -946,7 +946,13 @@ def show_h5_structure_html(file_path, include_attrs=True, attrs_inline=True, dis
     """
 
     def format_value(value):
-        return escape(repr(value))
+        value_repr = escape(repr(value))
+        if isinstance(value, np.ndarray):
+            return (
+                f"{value_repr} "
+                f"<span class='h5-array-shape'>shape={escape(str(value.shape))}</span>"
+            )
+        return value_repr
 
     def render_attrs(node, node_name):
         if not include_attrs or len(node.attrs) == 0:
@@ -1009,35 +1015,60 @@ def show_h5_structure_html(file_path, include_attrs=True, attrs_inline=True, dis
 <div class="h5-tree">
   <style>
     .h5-tree {{
+      color-scheme: light dark;
       font-family: "Menlo", "Consolas", "DejaVu Sans Mono", monospace;
       font-size: 13px;
       line-height: 1.5;
-      color: #1f2937;
+      color: var(--h5-fg);
+      --h5-fg: #1f2937;
+      --h5-muted: #6b7280;
+      --h5-border: #d1d5db;
+      --h5-group: #0f766e;
+      --h5-dataset: #1d4ed8;
+      --h5-attrs: #7c2d12;
+      --h5-node-ref: #7c3aed;
+      --h5-attr-key: #b45309;
+      --h5-attr-value: #374151;
+      --h5-root: #111827;
+    }}
+    @media (prefers-color-scheme: dark) {{
+      .h5-tree {{
+        --h5-fg: #e5e7eb;
+        --h5-muted: #9ca3af;
+        --h5-border: #4b5563;
+        --h5-group: #5eead4;
+        --h5-dataset: #93c5fd;
+        --h5-attrs: #fdba74;
+        --h5-node-ref: #c4b5fd;
+        --h5-attr-key: #fbbf24;
+        --h5-attr-value: #f3f4f6;
+        --h5-root: #f9fafb;
+      }}
     }}
     .h5-tree ul {{
       list-style: none;
       margin: 0.2rem 0 0.2rem 1.1rem;
       padding-left: 1rem;
-      border-left: 1px solid #d1d5db;
+      border-left: 1px solid var(--h5-border);
     }}
     .h5-tree li {{
       margin: 0.2rem 0;
     }}
     .h5-group {{
-      color: #0f766e;
+      color: var(--h5-group);
       font-weight: 700;
     }}
     .h5-dataset {{
-      color: #1d4ed8;
+      color: var(--h5-dataset);
       font-weight: 700;
     }}
     .h5-meta {{
-      color: #6b7280;
+      color: var(--h5-muted);
       font-weight: 500;
     }}
     .h5-attrs-inline, .h5-attrs-list {{
       margin-top: 0.15rem;
-      color: #7c2d12;
+      color: var(--h5-attrs);
     }}
     .h5-attrs-inline {{
       display: grid;
@@ -1053,18 +1084,22 @@ def show_h5_structure_html(file_path, include_attrs=True, attrs_inline=True, dis
       overflow-wrap: anywhere;
     }}
     .h5-node-ref {{
-      color: #7c3aed;
+      color: var(--h5-node-ref);
       font-weight: 700;
     }}
     .h5-attr-key {{
-      color: #b45309;
+      color: var(--h5-attr-key);
       font-weight: 700;
     }}
     .h5-attr-value {{
-      color: #374151;
+      color: var(--h5-attr-value);
+    }}
+    .h5-array-shape {{
+      color: var(--h5-muted);
+      font-weight: 500;
     }}
     .h5-root {{
-      color: #111827;
+      color: var(--h5-root);
       font-weight: 800;
     }}
   </style>
