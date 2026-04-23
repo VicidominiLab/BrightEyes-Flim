@@ -832,6 +832,7 @@ class H5DataCalibrator:
                     nbin=int(data_dataset.shape[-2]),
                     period_ns=self.period_ns,
                 )
+                laser_freq_in_mhz = 1e3 / period_ns
 
                 target_group = self._get_target_group(calibration_group, data_key)
                 self._set_group_attrs(
@@ -858,9 +859,10 @@ class H5DataCalibrator:
                         "channel_skew_fit_reference_channel": self.channel_skew_fit_reference_channel,
                         "channel_skew_fit_upsampling": self.channel_skew_fit_upsampling,
                         "channel_skew_fit_apodize": self.channel_skew_fit_apodize,
-                        "nbin": nbin,
-                        "dt_ns": dt_ns,
-                        "period_ns": period_ns,
+                        "number_of_bins": nbin,
+                        "bin_width_in_ns": dt_ns,
+                        "laser_period_in_ns": period_ns,
+                        "laser_freq_in_mhz": laser_freq_in_mhz,
                         "channel_count": int(data_dataset.shape[-1]),
                         "channel_count_calibrated": len(channel_indices),
                         "data_shape": list(data_dataset.shape),
@@ -1188,15 +1190,29 @@ class H5DataCalibrator:
                 target_group.attrs["channel_skew_fit_reference_position"] = (
                     channel_skew_reference_info["reference_position"]
                 )
+                channels_time_skew_in_bins = np.asarray(channels_time_skew, dtype=float)
+                channels_time_skew_err_in_bins = np.asarray(channels_time_skew_err, dtype=float)
+                channels_time_skew_in_ns = channels_time_skew_in_bins * float(dt_ns)
+                channels_time_skew_err_in_ns = channels_time_skew_err_in_bins * float(dt_ns)
                 self._replace_dataset(
                     target_group,
-                    "channels_time_skew",
-                    np.asarray(channels_time_skew, dtype=float),
+                    "channels_time_skew_in_bins",
+                    channels_time_skew_in_bins,
                 )
                 self._replace_dataset(
                     target_group,
-                    "channels_time_skew_err",
-                    np.asarray(channels_time_skew_err, dtype=float),
+                    "channels_time_skew_err_in_bins",
+                    channels_time_skew_err_in_bins,
+                )
+                self._replace_dataset(
+                    target_group,
+                    "channels_time_skew_in_ns",
+                    channels_time_skew_in_ns,
+                )
+                self._replace_dataset(
+                    target_group,
+                    "channels_time_skew_err_in_ns",
+                    channels_time_skew_err_in_ns,
                 )
                 string_dtype = h5py.string_dtype(encoding="utf-8")
                 if "irf_type" in target_group:
