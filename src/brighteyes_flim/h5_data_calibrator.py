@@ -22,7 +22,7 @@ __all__ = [
 ]
 
 DEFAULT_DATA_KEY = ("data", "data_channels_extra")
-DEFAULT_REFERENCE_KEY = ("data", "data_channels_extra")
+DEFAULT_REFERENCE_KEY = None
 DEFAULT_TAU_REF = None
 DEFAULT_REFERENCE_TYPE = "ref"
 DEFAULT_FIT_MODE = "model_shift"
@@ -30,6 +30,11 @@ DEFAULT_FIT_TYPE = "circular"
 DEFAULT_C_REF = 1.0
 DEFAULT_IRF_ITERATIONS = 300
 DEFAULT_REGULARIZATION = 0
+DEFAULT_CHANNEL_SKEW_TYPE = "fit"
+DEFAULT_CHANNEL_SKEW_TYPE_FIT_SOURCE = "ref"
+DEFAULT_CHANNEL_SKEW_FIT_REFERENCE_CHANNEL = 12
+DEFAULT_CHANNEL_SKEW_FIT_UPSAMPLING = 10
+DEFAULT_CHANNEL_SKEW_FIT_APODIZE = False
 DEFAULT_OVERWRITE = True
 
 
@@ -91,13 +96,32 @@ class H5DataCalibrator:
         Numerical stability constant passed to the fitting routines.
     regularization : float, default ``0``
         Regularization strength used during IRF estimation.
+    channel_skew_type : {"fit"}, default ``"fit"``
+        Strategy used to populate ``channels_time_skew`` outputs. Only
+        ``"fit"`` is currently supported.
+    channel_skew_type_fit_source : {"ref", "irf", "data"} or numpy.ndarray, default ``"ref"``
+        Source used for channel-skew generation. String values select one of
+        the stored calibration histograms, while a 1D NumPy array forces the
+        final ``channels_time_skew`` values directly. When the ``data`` key
+        is present, non-``data`` groups are anchored by default to the
+        selected reference channel from the ``data`` group.
+    channel_skew_fit_reference_channel : int, default ``12``
+        Reference channel index used by ``ShiftVectors``. The value is matched
+        against the calibrated ``channel_index`` entries for each dataset key.
+        When the default value ``12`` is not present, the middle calibrated
+        channel is used automatically.
+    channel_skew_fit_upsampling : int, default ``10``
+        Upsampling factor forwarded to ``ShiftVectors``.
+    channel_skew_fit_apodize : bool, default ``False``
+        Apodization flag forwarded to ``ShiftVectors``.
 
     Notes
     -----
     The input datasets are expected to have shape
     ``[repetition, z, y, x, t, ch]``. Only one channel histogram at a time is
     materialized in memory, so the whole 6D dataset is never converted to a
-    NumPy array up front.
+    NumPy array up front. Calibration results for each data key are always
+    written under ``<calibration_key>/<data_key>/``, even in single-key mode.
     """
 
     DEFAULT_DATA_KEYS = DEFAULT_DATA_KEY
@@ -125,6 +149,11 @@ class H5DataCalibrator:
         irf_iterations=DEFAULT_IRF_ITERATIONS,
         eps=1e-8,
         regularization=DEFAULT_REGULARIZATION,
+        channel_skew_type=DEFAULT_CHANNEL_SKEW_TYPE,
+        channel_skew_type_fit_source=DEFAULT_CHANNEL_SKEW_TYPE_FIT_SOURCE,
+        channel_skew_fit_reference_channel=DEFAULT_CHANNEL_SKEW_FIT_REFERENCE_CHANNEL,
+        channel_skew_fit_upsampling=DEFAULT_CHANNEL_SKEW_FIT_UPSAMPLING,
+        channel_skew_fit_apodize=DEFAULT_CHANNEL_SKEW_FIT_APODIZE,
     ):
         self.data_path = Path(data_path)
         self.reference_path = Path(reference_path)
@@ -147,6 +176,42 @@ class H5DataCalibrator:
         self.irf_iterations = irf_iterations
         self.eps = eps
         self.regularization = regularization
+        self.channel_skew_type = self._normalize_channel_skew_type(channel_skew_type)
+        self.channel_skew_type_fit_source = self._normalize_channel_skew_type_fit_source(
+            channel_skew_type_fit_source
+        )
+        self.channel_skew_fit_reference_channel = int(channel_skew_fit_reference_channel)
+        self.channel_skew_fit_upsampling = int(channel_skew_fit_upsampling)
+        self.channel_skew_fit_apodize = bool(channel_skew_fit_apodize)
+
+        if self.channel_skew_fit_upsampling <= 0:
+            raise ValueError("channel_skew_fit_upsampling must be a positive integer")
+
+    @staticmethod
+    def _normalize_channel_skew_type(channel_skew_type):
+        normalized = str(channel_skew_type).strip().lower()
+        if normalized != "fit":
+            raise NotImplementedError(
+                "channel_skew_type values other than 'fit' are not supported yet"
+            )
+        return normalized
+
+    @staticmethod
+    def _normalize_channel_skew_type_fit_source(channel_skew_type_fit_source):
+        if isinstance(channel_skew_type_fit_source, np.ndarray):
+            source_array = np.asarray(channel_skew_type_fit_source, dtype=float)
+            if source_array.ndim != 1:
+                raise ValueError(
+                    "channel_skew_type_fit_source array must be 1D with one value per calibrated channel"
+                )
+            return source_array
+
+        normalized = str(channel_skew_type_fit_source).strip().lower()
+        if normalized not in {"ref", "irf", "data"}:
+            raise ValueError(
+                "channel_skew_type_fit_source must be 'ref', 'irf', 'data', or a 1D numpy.ndarray"
+            )
+        return normalized
 
     @classmethod
     def _normalize_key_sequence(cls, keys, param_name):
@@ -425,24 +490,87 @@ class H5DataCalibrator:
             return str(tau_ref)
 
     @staticmethod
-    def _empty_fit_payload(nbin, reference_type, data_histogram, reference_histogram, irf_source):
+    def _std_from_variance(variance):
+        try:
+            variance = float(variance)
+        except (TypeError, ValueError):
+            return np.nan
+        if not np.isfinite(variance):
+            return np.nan
+        return float(np.sqrt(max(variance, 0.0)))
+
+    @classmethod
+    def _parameter_error_payload(cls, covariance, dt_ns):
+        errors = {
+            "fit_param_C_err": np.nan,
+            "tau_err_ns": np.nan,
+            "common_delay_err_in_bins": np.nan,
+            "common_delay_err_in_ns": np.nan,
+        }
+        covariance = np.asarray(covariance, dtype=float)
+        if covariance.shape != (3, 3):
+            return errors
+
+        diag = np.diag(covariance)
+        errors["fit_param_C_err"] = cls._std_from_variance(diag[0])
+        errors["common_delay_err_in_bins"] = cls._std_from_variance(diag[1])
+        errors["tau_err_ns"] = cls._std_from_variance(diag[2])
+        if np.isfinite(errors["common_delay_err_in_bins"]) and np.isfinite(dt_ns):
+            errors["common_delay_err_in_ns"] = float(
+                errors["common_delay_err_in_bins"] * float(dt_ns)
+            )
+        return errors
+
+    @staticmethod
+    def _fit_error(data_for_fit, data_fitted):
+        try:
+            data_norm = Alignment._normalize_histogram_1d(
+                data_for_fit,
+                name="data_for_fit",
+            )
+        except ValueError:
+            return np.nan
+
+        data_fitted = np.asarray(data_fitted, dtype=float)
+        if data_fitted.shape != data_norm.shape:
+            return np.nan
+        fit_sum = float(np.sum(data_fitted))
+        if not np.isfinite(fit_sum) or fit_sum <= 0:
+            return np.nan
+
+        fit_norm = data_fitted / fit_sum
+        residual = data_norm - fit_norm
+        return float(np.sqrt(np.mean(np.square(residual))))
+
+    @staticmethod
+    def _empty_fit_payload(
+        nbin,
+        reference_type,
+        data_for_fit_histogram,
+        ref_for_fit_histogram,
+        irf_type,
+    ):
         zero_hist = np.zeros(int(nbin), dtype=float)
         payload = {
-            "C": np.nan,
-            "tau": np.nan,
-            "tau_ref": np.nan,
-            "dT": np.nan,
-            "dT_ns": np.nan,
-            "cov": np.full((3, 3), np.nan, dtype=float),
-            "data_histogram": np.asarray(data_histogram, dtype=float),
-            "irf": zero_hist.copy(),
-            "irf_calibrated": zero_hist.copy(),
-            "fit": zero_hist.copy(),
-            "irf_source": str(irf_source),
+            "fit_param_C": np.nan,
+            "fit_param_C_err": np.nan,
+            "tau_ns": np.nan,
+            "tau_err_ns": np.nan,
+            "tau_ref_ns": np.nan,
+            "common_delay_in_bins": np.nan,
+            "common_delay_in_ns": np.nan,
+            "common_delay_err_in_bins": np.nan,
+            "common_delay_err_in_ns": np.nan,
+            "fit_error": np.nan,
+            "data_for_fit": np.asarray(data_for_fit_histogram, dtype=float),
+            "irf_for_fit": zero_hist.copy(),
+            "irf_common_delay_realigned": zero_hist.copy(),
+            "data_fitted": zero_hist.copy(),
+            "irf_type": str(irf_type),
         }
         if reference_type == "ref":
-            payload["ref_original"] = np.asarray(reference_histogram, dtype=float)
-            payload["ref_calibrated"] = zero_hist.copy()
+            payload["ref_for_fit"] = np.asarray(ref_for_fit_histogram, dtype=float)
+            payload["ref_common_delay_realigned"] = zero_hist.copy()
         return payload
 
     def _prepare_output_file(self):
@@ -456,11 +584,169 @@ class H5DataCalibrator:
         return self.output_path
 
     def _get_target_group(self, calibration_group, data_key):
-        if len(self.data_keys) == 1:
-            return calibration_group
         if data_key in calibration_group:
             del calibration_group[data_key]
         return calibration_group.create_group(data_key)
+
+    @staticmethod
+    def _channel_skew_source_attr_value(channel_skew_type_fit_source):
+        if isinstance(channel_skew_type_fit_source, np.ndarray):
+            return "array"
+        return str(channel_skew_type_fit_source)
+
+    def _resolve_channel_skew_reference_position(self, channel_index, data_key):
+        channel_index = np.asarray(channel_index, dtype=int)
+        matches = np.flatnonzero(channel_index == self.channel_skew_fit_reference_channel)
+        if matches.size > 0:
+            resolved_position = int(matches[0])
+            return resolved_position, int(channel_index[resolved_position])
+
+        if self.channel_skew_fit_reference_channel == DEFAULT_CHANNEL_SKEW_FIT_REFERENCE_CHANNEL:
+            resolved_position = int(len(channel_index) // 2)
+            return resolved_position, int(channel_index[resolved_position])
+
+        raise ValueError(
+            "channel_skew_fit_reference_channel="
+            f"{self.channel_skew_fit_reference_channel} is not present in the calibrated "
+            f"channel_index for data key {data_key!r}"
+        )
+
+    def _validate_channel_skew_configuration(self, channel_index, data_key):
+        channel_index = np.asarray(channel_index, dtype=int)
+        source = self.channel_skew_type_fit_source
+
+        if isinstance(source, np.ndarray):
+            if source.shape != (len(channel_index),):
+                raise ValueError(
+                    "channel_skew_type_fit_source array must have shape "
+                    f"({len(channel_index)},) for data key {data_key!r}, got {source.shape}"
+                )
+            return
+
+        if source == "ref" and self.reference_type != "ref":
+            raise ValueError(
+                f"channel_skew_type_fit_source='ref' is not available for data key {data_key!r} "
+                f"when reference_type={self.reference_type!r}"
+            )
+
+    @staticmethod
+    def _validate_channel_skew_source_histogram(calib, channel_count, data_key, source_name):
+        calib = np.asarray(calib, dtype=float)
+        if calib.ndim != 2 or calib.shape[1] != channel_count:
+            raise ValueError(
+                f"channel skew source {source_name!r} for data key {data_key!r} must have shape "
+                f"(t, {channel_count}), got {calib.shape}"
+            )
+        return calib
+
+    def _run_shift_vectors(self, calib, reference_position, data_key):
+        from brighteyes_ism.analysis.APR_lib import ShiftVectors
+
+        shifts, errors = ShiftVectors(
+            np.expand_dims(calib, axis=0),
+            self.channel_skew_fit_upsampling,
+            reference_position,
+            apodize=self.channel_skew_fit_apodize,
+        )
+
+        shifts = np.asarray(shifts, dtype=float)
+        errors = np.asarray(errors, dtype=float)
+        if shifts.ndim != 2 or errors.ndim != 2 or shifts.shape[1] <= 1 or errors.shape[1] <= 1:
+            raise ValueError(
+                f"ShiftVectors returned unexpected shapes for data key {data_key!r}: "
+                f"shifts={shifts.shape}, errors={errors.shape}"
+            )
+        if shifts.shape[0] != calib.shape[1] or errors.shape[0] != calib.shape[1]:
+            raise ValueError(
+                f"ShiftVectors output length mismatch for data key {data_key!r}: "
+                f"expected {calib.shape[1]}, got shifts={shifts.shape[0]} and errors={errors.shape[0]}"
+            )
+        return shifts, errors
+
+    def _compute_channel_skew(self, channel_index, source_histograms, data_key, channel_skew_cache):
+        channel_index = np.asarray(channel_index, dtype=int)
+        channel_count = int(len(channel_index))
+        source = self.channel_skew_type_fit_source
+
+        if isinstance(source, np.ndarray):
+            if source.shape != (channel_count,):
+                raise ValueError(
+                    "channel_skew_type_fit_source array must have shape "
+                    f"({channel_count},) for data key {data_key!r}, got {source.shape}"
+                )
+            return (
+                np.asarray(source, dtype=float),
+                np.full(channel_count, np.nan, dtype=float),
+                {
+                    "reference_data_key": data_key,
+                    "reference_channel_resolved": np.nan,
+                    "reference_position": np.nan,
+                },
+            )
+
+        if source not in source_histograms:
+            raise ValueError(
+                f"channel_skew_type_fit_source={source!r} is not available for data key {data_key!r}"
+            )
+
+        calib = self._validate_channel_skew_source_histogram(
+            source_histograms[source],
+            channel_count,
+            data_key,
+            source,
+        )
+
+        reference_data_key = data_key
+        reference_channel_index = channel_index
+        reference_sources = source_histograms
+
+        if data_key != "data" and "data" in channel_skew_cache:
+            reference_data_key = "data"
+            reference_channel_index = np.asarray(channel_skew_cache["data"]["channel_index"], dtype=int)
+            reference_sources = channel_skew_cache["data"]["sources"]
+
+        if source not in reference_sources:
+            raise ValueError(
+                f"channel_skew_type_fit_source={source!r} is not available in reference data key "
+                f"{reference_data_key!r} for data key {data_key!r}"
+            )
+
+        reference_source_hist = self._validate_channel_skew_source_histogram(
+            reference_sources[source],
+            len(reference_channel_index),
+            reference_data_key,
+            source,
+        )
+        reference_position, reference_channel_resolved = self._resolve_channel_skew_reference_position(
+            reference_channel_index,
+            reference_data_key,
+        )
+
+        if reference_data_key == data_key:
+            shift_input = calib
+            shift_reference_position = reference_position
+        else:
+            shift_input = np.concatenate(
+                [calib, reference_source_hist[:, reference_position : reference_position + 1]],
+                axis=1,
+            )
+            shift_reference_position = channel_count
+
+        shifts, errors = self._run_shift_vectors(
+            shift_input,
+            shift_reference_position,
+            data_key,
+        )
+
+        return (
+            shifts[:channel_count, 1],
+            errors[:channel_count, 1],
+            {
+                "reference_data_key": reference_data_key,
+                "reference_channel_resolved": reference_channel_resolved,
+                "reference_position": reference_position,
+            },
+        )
 
     def calibrate(self):
         data_metadata = mcs.metadata_load(str(self.data_path))
@@ -495,17 +781,30 @@ class H5DataCalibrator:
                     "initial_dT": self.initial_dT,
                     "initial_C": self.initial_C,
                     "force_C_normalized": self.force_C_normalized,
+                    "channel_skew_type": self.channel_skew_type,
+                    "channel_skew_type_fit_source": self._channel_skew_source_attr_value(
+                        self.channel_skew_type_fit_source
+                    ),
+                    "channel_skew_fit_reference_channel": self.channel_skew_fit_reference_channel,
+                    "channel_skew_fit_upsampling": self.channel_skew_fit_upsampling,
+                    "channel_skew_fit_apodize": self.channel_skew_fit_apodize,
+                    "fit_error_metric": "rmse_normalized_histograms",
                     "data_key_count": len(self.data_keys),
                 },
             )
             self._write_metadata_group(calibration_group, "input_data_metadata", data_metadata)
             self._write_metadata_group(calibration_group, "input_reference_metadata", reference_metadata)
 
+            ordered_data_keys = list(self.data_keys)
+            if "data" in ordered_data_keys:
+                ordered_data_keys.insert(0, ordered_data_keys.pop(ordered_data_keys.index("data")))
+            channel_skew_cache = {}
+
             data_key_iterator = tqdm(
-                self.data_keys,
+                ordered_data_keys,
                 desc="Calibrating data keys",
                 unit="key",
-                disable=len(self.data_keys) <= 1,
+                disable=len(ordered_data_keys) <= 1,
             )
             for data_key in data_key_iterator:
                 reference_key = self.reference_key_map[data_key]
@@ -526,6 +825,7 @@ class H5DataCalibrator:
                 reference_channel_map = self._resolve_reference_channel_map(data_dataset, reference_dataset)
                 if len(channel_indices) == 0:
                     raise ValueError("channels must contain at least one channel index")
+                self._validate_channel_skew_configuration(channel_indices, data_key)
 
                 nbin, dt_ns, period_ns, t_ns = self.build_time_axis(
                     data_metadata,
@@ -551,6 +851,13 @@ class H5DataCalibrator:
                         "initial_dT": self.initial_dT,
                         "initial_C": self.initial_C,
                         "force_C_normalized": self.force_C_normalized,
+                        "channel_skew_type": self.channel_skew_type,
+                        "channel_skew_type_fit_source": self._channel_skew_source_attr_value(
+                            self.channel_skew_type_fit_source
+                        ),
+                        "channel_skew_fit_reference_channel": self.channel_skew_fit_reference_channel,
+                        "channel_skew_fit_upsampling": self.channel_skew_fit_upsampling,
+                        "channel_skew_fit_apodize": self.channel_skew_fit_apodize,
                         "nbin": nbin,
                         "dt_ns": dt_ns,
                         "period_ns": period_ns,
@@ -560,25 +867,29 @@ class H5DataCalibrator:
                         "reference_shape": list(reference_dataset.shape),
                         "channel_axis": -1,
                         "stacked_histogram_layout": "(t, ch)",
-                        "stacked_covariance_layout": "(param, param, ch)",
+                        "fit_error_metric": "rmse_normalized_histograms",
                     },
                 )
 
                 stacked_channel_index = []
-                stacked_reference_channel_index = []
-                stacked_C = []
-                stacked_tau = []
-                stacked_tau_ref = []
-                stacked_dT_bins = []
-                stacked_dT_ns = []
-                stacked_irf_source = []
-                stacked_covariance = []
-                stacked_data_histogram = []
-                stacked_irf_original = []
-                stacked_irf_calibrated = []
-                stacked_fit = []
-                stacked_ref_original = []
-                stacked_ref_calibrated = []
+                stacked_channel_used_for_reference_in_time_skew = []
+                stacked_fit_param_C = []
+                stacked_fit_param_C_err = []
+                stacked_tau_ns = []
+                stacked_tau_err_ns = []
+                stacked_tau_ref_ns = []
+                stacked_common_delay_in_bins = []
+                stacked_common_delay_err_in_bins = []
+                stacked_common_delay_in_ns = []
+                stacked_common_delay_err_in_ns = []
+                stacked_fit_error = []
+                stacked_irf_type = []
+                stacked_data_for_fit = []
+                stacked_irf_for_fit = []
+                stacked_irf_common_delay_realigned = []
+                stacked_data_fitted = []
+                stacked_ref_for_fit = []
+                stacked_ref_common_delay_realigned = []
 
                 channel_iterator = tqdm(
                     channel_indices,
@@ -587,11 +898,14 @@ class H5DataCalibrator:
                     leave=False,
                 )
                 for channel_index in channel_iterator:
-                    reference_channel_index = reference_channel_map[channel_index]
-                    data_histogram = self._sum_histogram_for_channel(data_dataset, channel_index)
-                    reference_histogram = self._sum_histogram_for_channel(reference_dataset, reference_channel_index)
-                    data_sum = float(np.sum(data_histogram))
-                    reference_sum = float(np.sum(reference_histogram))
+                    reference_channel_for_fit = reference_channel_map[channel_index]
+                    data_for_fit_histogram = self._sum_histogram_for_channel(data_dataset, channel_index)
+                    ref_for_fit_histogram = self._sum_histogram_for_channel(
+                        reference_dataset,
+                        reference_channel_for_fit,
+                    )
+                    data_sum = float(np.sum(data_for_fit_histogram))
+                    reference_sum = float(np.sum(ref_for_fit_histogram))
 
                     if not np.isfinite(data_sum) or data_sum <= 0:
                         warnings.warn(
@@ -605,15 +919,15 @@ class H5DataCalibrator:
                         fit_payload = self._empty_fit_payload(
                             nbin=nbin,
                             reference_type=self.reference_type,
-                            data_histogram=data_histogram,
-                            reference_histogram=reference_histogram,
-                            irf_source="skipped_zero_sum_data",
+                            data_for_fit_histogram=data_for_fit_histogram,
+                            ref_for_fit_histogram=ref_for_fit_histogram,
+                            irf_type="skipped_zero_sum_data",
                         )
                     elif not np.isfinite(reference_sum) or reference_sum <= 0:
                         warnings.warn(
                             (
                                 f"Skipping calibration for data key {data_key!r}, channel {channel_index}: "
-                                f"reference channel {reference_channel_index} histogram has a non-positive "
+                                f"reference channel {reference_channel_for_fit} histogram has a non-positive "
                                 "or non-finite sum"
                             ),
                             RuntimeWarning,
@@ -622,14 +936,14 @@ class H5DataCalibrator:
                         fit_payload = self._empty_fit_payload(
                             nbin=nbin,
                             reference_type=self.reference_type,
-                            data_histogram=data_histogram,
-                            reference_histogram=reference_histogram,
-                            irf_source="skipped_zero_sum_reference",
+                            data_for_fit_histogram=data_for_fit_histogram,
+                            ref_for_fit_histogram=ref_for_fit_histogram,
+                            irf_type="skipped_zero_sum_reference",
                         )
                     else:
                         fit_kwargs = {
                             "t": t_ns,
-                            "data": data_histogram,
+                            "data": data_for_fit_histogram,
                             "period": period_ns,
                             "C_ref": self.C_ref,
                             "irf_output": "original",
@@ -645,38 +959,59 @@ class H5DataCalibrator:
                             "regularization": self.regularization,
                         }
                         if self.reference_type == "ref":
-                            fit_kwargs["ref"] = reference_histogram
+                            fit_kwargs["ref"] = ref_for_fit_histogram
                             fit_kwargs["tau_ref"] = self.tau_ref
                         else:
-                            fit_kwargs["irf"] = reference_histogram
+                            fit_kwargs["irf"] = ref_for_fit_histogram
 
                         try:
                             fit_result = Alignment.fit_data_with_ref_or_irf(**fit_kwargs)
-                            irf_original = np.asarray(fit_result["irf"], dtype=float)
-                            irf_calibrated = Alignment._normalize_histogram_1d(
-                                Alignment.linear_shift(irf_original, fit_result["dT"], cyclic=True),
-                                name="irf_calibrated",
+                            irf_for_fit = np.asarray(fit_result["irf"], dtype=float)
+                            irf_common_delay_realigned = Alignment._normalize_histogram_1d(
+                                Alignment.linear_shift(irf_for_fit, fit_result["dT"], cyclic=True),
+                                name="irf_common_delay_realigned",
+                            )
+                            data_fitted = np.asarray(fit_result["fit"], dtype=float)
+                            parameter_errors = self._parameter_error_payload(
+                                fit_result["cov"],
+                                dt_ns,
                             )
                             fit_payload = {
-                                "C": float(fit_result["C"]),
-                                "tau": float(fit_result["tau"]),
-                                "tau_ref": (
+                                "fit_param_C": float(fit_result["C"]),
+                                "fit_param_C_err": float(parameter_errors["fit_param_C_err"]),
+                                "tau_ns": float(fit_result["tau"]),
+                                "tau_err_ns": float(parameter_errors["tau_err_ns"]),
+                                "tau_ref_ns": (
                                     np.nan
                                     if fit_result["tau_ref"] is None
                                     else float(fit_result["tau_ref"])
                                 ),
-                                "dT": float(fit_result["dT"]),
-                                "dT_ns": float(fit_result["dT_ns"]),
-                                "cov": np.asarray(fit_result["cov"], dtype=float),
-                                "data_histogram": np.asarray(data_histogram, dtype=float),
-                                "irf": np.asarray(irf_original, dtype=float),
-                                "irf_calibrated": np.asarray(irf_calibrated, dtype=float),
-                                "fit": np.asarray(fit_result["fit"], dtype=float),
-                                "irf_source": str(fit_result["irf_source"]),
+                                "common_delay_in_bins": float(fit_result["dT"]),
+                                "common_delay_in_ns": float(fit_result["dT_ns"]),
+                                "common_delay_err_in_bins": float(
+                                    parameter_errors["common_delay_err_in_bins"]
+                                ),
+                                "common_delay_err_in_ns": float(
+                                    parameter_errors["common_delay_err_in_ns"]
+                                ),
+                                "fit_error": float(
+                                    self._fit_error(data_for_fit_histogram, data_fitted)
+                                ),
+                                "data_for_fit": np.asarray(data_for_fit_histogram, dtype=float),
+                                "irf_for_fit": np.asarray(irf_for_fit, dtype=float),
+                                "irf_common_delay_realigned": np.asarray(
+                                    irf_common_delay_realigned,
+                                    dtype=float,
+                                ),
+                                "data_fitted": data_fitted,
+                                "irf_type": str(fit_result["irf_source"]),
                             }
                             if self.reference_type == "ref":
-                                fit_payload["ref_original"] = np.asarray(reference_histogram, dtype=float)
-                                fit_payload["ref_calibrated"] = np.asarray(
+                                fit_payload["ref_for_fit"] = np.asarray(
+                                    ref_for_fit_histogram,
+                                    dtype=float,
+                                )
+                                fit_payload["ref_common_delay_realigned"] = np.asarray(
                                     fit_result["ref_shifted"],
                                     dtype=float,
                                 )
@@ -692,102 +1027,194 @@ class H5DataCalibrator:
                             fit_payload = self._empty_fit_payload(
                                 nbin=nbin,
                                 reference_type=self.reference_type,
-                                data_histogram=data_histogram,
-                                reference_histogram=reference_histogram,
-                                irf_source="fit_failed",
+                                data_for_fit_histogram=data_for_fit_histogram,
+                                ref_for_fit_histogram=ref_for_fit_histogram,
+                                irf_type="fit_failed",
                             )
 
                     stacked_channel_index.append(channel_index)
-                    stacked_reference_channel_index.append(reference_channel_index)
-                    stacked_C.append(float(fit_payload["C"]))
-                    stacked_tau.append(float(fit_payload["tau"]))
-                    stacked_tau_ref.append(float(fit_payload["tau_ref"]))
-                    stacked_dT_bins.append(float(fit_payload["dT"]))
-                    stacked_dT_ns.append(float(fit_payload["dT_ns"]))
-                    stacked_irf_source.append(str(fit_payload["irf_source"]))
-                    stacked_covariance.append(np.asarray(fit_payload["cov"], dtype=float))
-                    stacked_data_histogram.append(np.asarray(fit_payload["data_histogram"], dtype=float))
-                    stacked_irf_original.append(np.asarray(fit_payload["irf"], dtype=float))
-                    stacked_irf_calibrated.append(np.asarray(fit_payload["irf_calibrated"], dtype=float))
-                    stacked_fit.append(np.asarray(fit_payload["fit"], dtype=float))
+                    stacked_channel_used_for_reference_in_time_skew.append(reference_channel_for_fit)
+                    stacked_fit_param_C.append(float(fit_payload["fit_param_C"]))
+                    stacked_fit_param_C_err.append(float(fit_payload["fit_param_C_err"]))
+                    stacked_tau_ns.append(float(fit_payload["tau_ns"]))
+                    stacked_tau_err_ns.append(float(fit_payload["tau_err_ns"]))
+                    stacked_tau_ref_ns.append(float(fit_payload["tau_ref_ns"]))
+                    stacked_common_delay_in_bins.append(float(fit_payload["common_delay_in_bins"]))
+                    stacked_common_delay_err_in_bins.append(
+                        float(fit_payload["common_delay_err_in_bins"])
+                    )
+                    stacked_common_delay_in_ns.append(float(fit_payload["common_delay_in_ns"]))
+                    stacked_common_delay_err_in_ns.append(
+                        float(fit_payload["common_delay_err_in_ns"])
+                    )
+                    stacked_fit_error.append(float(fit_payload["fit_error"]))
+                    stacked_irf_type.append(str(fit_payload["irf_type"]))
+                    stacked_data_for_fit.append(np.asarray(fit_payload["data_for_fit"], dtype=float))
+                    stacked_irf_for_fit.append(np.asarray(fit_payload["irf_for_fit"], dtype=float))
+                    stacked_irf_common_delay_realigned.append(
+                        np.asarray(fit_payload["irf_common_delay_realigned"], dtype=float)
+                    )
+                    stacked_data_fitted.append(np.asarray(fit_payload["data_fitted"], dtype=float))
                     if self.reference_type == "ref":
-                        stacked_ref_original.append(np.asarray(fit_payload["ref_original"], dtype=float))
-                        stacked_ref_calibrated.append(
-                            np.asarray(fit_payload["ref_calibrated"], dtype=float)
+                        stacked_ref_for_fit.append(np.asarray(fit_payload["ref_for_fit"], dtype=float))
+                        stacked_ref_common_delay_realigned.append(
+                            np.asarray(fit_payload["ref_common_delay_realigned"], dtype=float)
                         )
 
+                channel_index_array = np.asarray(stacked_channel_index, dtype=int)
+                channel_used_for_reference_in_time_skew_array = np.asarray(
+                    stacked_channel_used_for_reference_in_time_skew,
+                    dtype=int,
+                )
+                fit_param_C_array = np.asarray(stacked_fit_param_C, dtype=float)
+                fit_param_C_err_array = np.asarray(stacked_fit_param_C_err, dtype=float)
+                tau_ns_array = np.asarray(stacked_tau_ns, dtype=float)
+                tau_err_ns_array = np.asarray(stacked_tau_err_ns, dtype=float)
+                tau_ref_ns_array = np.asarray(stacked_tau_ref_ns, dtype=float)
+                common_delay_in_bins_array = np.asarray(stacked_common_delay_in_bins, dtype=float)
+                common_delay_err_in_bins_array = np.asarray(
+                    stacked_common_delay_err_in_bins,
+                    dtype=float,
+                )
+                common_delay_in_ns_array = np.asarray(stacked_common_delay_in_ns, dtype=float)
+                common_delay_err_in_ns_array = np.asarray(
+                    stacked_common_delay_err_in_ns,
+                    dtype=float,
+                )
+                fit_error_array = np.asarray(stacked_fit_error, dtype=float)
+                data_for_fit_stack = np.stack(stacked_data_for_fit, axis=-1)
+                irf_for_fit_stack = np.stack(stacked_irf_for_fit, axis=-1)
+                irf_common_delay_realigned_stack = np.stack(
+                    stacked_irf_common_delay_realigned,
+                    axis=-1,
+                )
+                data_fitted_stack = np.stack(stacked_data_fitted, axis=-1)
+
+                self._replace_dataset(target_group, "channel_index", channel_index_array)
                 self._replace_dataset(
                     target_group,
-                    "channel_index",
-                    np.asarray(stacked_channel_index, dtype=int),
+                    "channel_used_for_reference_in_time_skew",
+                    channel_used_for_reference_in_time_skew_array,
+                )
+                self._replace_dataset(target_group, "fit_param_C", fit_param_C_array)
+                self._replace_dataset(target_group, "fit_param_C_err", fit_param_C_err_array)
+                self._replace_dataset(target_group, "tau_ns", tau_ns_array)
+                self._replace_dataset(target_group, "tau_err_ns", tau_err_ns_array)
+                self._replace_dataset(target_group, "tau_ref_ns", tau_ref_ns_array)
+                self._replace_dataset(
+                    target_group,
+                    "common_delay_in_bins",
+                    common_delay_in_bins_array,
                 )
                 self._replace_dataset(
                     target_group,
-                    "reference_channel_index",
-                    np.asarray(stacked_reference_channel_index, dtype=int),
-                )
-                self._replace_dataset(target_group, "C", np.asarray(stacked_C, dtype=float))
-                self._replace_dataset(target_group, "tau_ns", np.asarray(stacked_tau, dtype=float))
-                self._replace_dataset(target_group, "tau_ref_ns", np.asarray(stacked_tau_ref, dtype=float))
-                self._replace_dataset(
-                    target_group,
-                    "delta_t_correction_bins",
-                    np.asarray(stacked_dT_bins, dtype=float),
+                    "common_delay_in_ns",
+                    common_delay_in_ns_array,
                 )
                 self._replace_dataset(
                     target_group,
-                    "delta_t_correction_ns",
-                    np.asarray(stacked_dT_ns, dtype=float),
+                    "common_delay_err_in_bins",
+                    common_delay_err_in_bins_array,
                 )
                 self._replace_dataset(
                     target_group,
-                    "covariance",
-                    np.stack(stacked_covariance, axis=-1),
+                    "common_delay_err_in_ns",
+                    common_delay_err_in_ns_array,
                 )
                 self._replace_dataset(
                     target_group,
-                    "data_histogram",
-                    np.stack(stacked_data_histogram, axis=-1),
+                    "fit_error",
+                    fit_error_array,
                 )
                 self._replace_dataset(
                     target_group,
-                    "irf_original",
-                    np.stack(stacked_irf_original, axis=-1),
+                    "data_for_fit",
+                    data_for_fit_stack,
                 )
                 self._replace_dataset(
                     target_group,
-                    "irf_calibrated",
-                    np.stack(stacked_irf_calibrated, axis=-1),
+                    "irf_for_fit",
+                    irf_for_fit_stack,
                 )
                 self._replace_dataset(
                     target_group,
-                    "fit",
-                    np.stack(stacked_fit, axis=-1),
+                    "irf_common_delay_realigned",
+                    irf_common_delay_realigned_stack,
                 )
+                self._replace_dataset(
+                    target_group,
+                    "data_fitted",
+                    data_fitted_stack,
+                )
+
+                channel_skew_sources = {
+                    "data": data_for_fit_stack,
+                    "irf": irf_common_delay_realigned_stack,
+                }
                 if self.reference_type == "ref":
-                    self._replace_dataset(
-                        target_group,
-                        "ref_original",
-                        np.stack(stacked_ref_original, axis=-1),
+                    ref_for_fit_stack = np.stack(stacked_ref_for_fit, axis=-1)
+                    ref_common_delay_realigned_stack = np.stack(
+                        stacked_ref_common_delay_realigned,
+                        axis=-1,
                     )
                     self._replace_dataset(
                         target_group,
-                        "ref_calibrated",
-                        np.stack(stacked_ref_calibrated, axis=-1),
+                        "ref_for_fit",
+                        ref_for_fit_stack,
                     )
+                    self._replace_dataset(
+                        target_group,
+                        "ref_common_delay_realigned",
+                        ref_common_delay_realigned_stack,
+                    )
+                    channel_skew_sources["ref"] = ref_common_delay_realigned_stack
+
+                (
+                    channels_time_skew,
+                    channels_time_skew_err,
+                    channel_skew_reference_info,
+                ) = self._compute_channel_skew(
+                    channel_index_array,
+                    channel_skew_sources,
+                    data_key,
+                    channel_skew_cache,
+                )
+                target_group.attrs["channel_skew_fit_reference_data_key"] = str(
+                    channel_skew_reference_info["reference_data_key"]
+                )
+                target_group.attrs[
+                    "channel_skew_fit_reference_channel_resolved"
+                ] = channel_skew_reference_info["reference_channel_resolved"]
+                target_group.attrs["channel_skew_fit_reference_position"] = (
+                    channel_skew_reference_info["reference_position"]
+                )
+                self._replace_dataset(
+                    target_group,
+                    "channels_time_skew",
+                    np.asarray(channels_time_skew, dtype=float),
+                )
+                self._replace_dataset(
+                    target_group,
+                    "channels_time_skew_err",
+                    np.asarray(channels_time_skew_err, dtype=float),
+                )
                 string_dtype = h5py.string_dtype(encoding="utf-8")
-                if "irf_source" in target_group:
-                    del target_group["irf_source"]
+                if "irf_type" in target_group:
+                    del target_group["irf_type"]
                 target_group.create_dataset(
-                    "irf_source",
-                    data=np.asarray(stacked_irf_source, dtype=object),
+                    "irf_type",
+                    data=np.asarray(stacked_irf_type, dtype=object),
                     dtype=string_dtype,
                 )
 
-                if len(self.data_keys) == 1:
-                    target_group.attrs["data_key_group_mode"] = "flat_root"
-                else:
-                    target_group.attrs["data_key_group_mode"] = "nested_under_calibration"
+                target_group.attrs["data_key_group_mode"] = "nested_under_calibration"
+                channel_skew_cache[data_key] = {
+                    "channel_index": channel_index_array.copy(),
+                    "sources": {
+                        key: np.asarray(value, dtype=float).copy()
+                        for key, value in channel_skew_sources.items()
+                    },
+                }
 
         return str(output_path)
 
@@ -804,6 +1231,11 @@ def calibrate_h5_file(
     C_ref=DEFAULT_C_REF,
     irf_iterations=DEFAULT_IRF_ITERATIONS,
     regularization=DEFAULT_REGULARIZATION,
+    channel_skew_type=DEFAULT_CHANNEL_SKEW_TYPE,
+    channel_skew_type_fit_source=DEFAULT_CHANNEL_SKEW_TYPE_FIT_SOURCE,
+    channel_skew_fit_reference_channel=DEFAULT_CHANNEL_SKEW_FIT_REFERENCE_CHANNEL,
+    channel_skew_fit_upsampling=DEFAULT_CHANNEL_SKEW_FIT_UPSAMPLING,
+    channel_skew_fit_apodize=DEFAULT_CHANNEL_SKEW_FIT_APODIZE,
     overwrite=DEFAULT_OVERWRITE,
     **kwargs,
 ):
@@ -822,9 +1254,11 @@ def calibrate_h5_file(
         HDF5 file containing the reference histogram or IRF source.
     data_key : str or iterable of str, default ``("data", "data_channels_extra")``
         Dataset key or keys to calibrate from ``data_path``.
-    reference_key : str or iterable of str or dict, default ``("data", "data_channels_extra")``
-        Dataset key or keys to read from ``reference_path``. A dict can also be
-        used to map each data key to a different reference key.
+    reference_key : None, str or iterable of str or dict, default ``None``
+        Dataset key or keys to read from ``reference_path``. When ``None``,
+        each entry in ``data_key`` is matched to the same key name in the
+        reference file. A dict can also be used to map each data key to a
+        different reference key.
     reference_type : {"ref", "irf"}, default ``"ref"``
         Type of reference input used during calibration.
     tau_ref : float or None, default ``None``
@@ -840,6 +1274,23 @@ def calibrate_h5_file(
         Number of iterations used when estimating the IRF.
     regularization : float, default ``0``
         Regularization strength used during IRF estimation.
+    channel_skew_type : {"fit"}, default ``"fit"``
+        Strategy used to generate ``channels_time_skew`` outputs. Only
+        ``"fit"`` is currently supported.
+    channel_skew_type_fit_source : {"ref", "irf", "data"} or numpy.ndarray, default ``"ref"``
+        Input used for channel-skew generation. String values select a
+        calibration histogram, while a 1D NumPy array forces the final
+        ``channels_time_skew`` values directly. When the ``data`` key is
+        present, non-``data`` groups are anchored by default to the selected
+        reference channel from the ``data`` group.
+    channel_skew_fit_reference_channel : int, default ``12``
+        Reference channel index used when computing channel skew with
+        ``ShiftVectors``. When the default value ``12`` is not present, the
+        middle calibrated channel is used automatically.
+    channel_skew_fit_upsampling : int, default ``10``
+        Upsampling factor forwarded to ``ShiftVectors``.
+    channel_skew_fit_apodize : bool, default ``False``
+        Apodization flag forwarded to ``ShiftVectors``.
     overwrite : bool, default ``True``
         If ``True``, overwrite an existing output file.
     **kwargs
@@ -852,7 +1303,8 @@ def calibrate_h5_file(
     Returns
     -------
     str
-        Path to the calibrated output HDF5 file.
+        Path to the calibrated output HDF5 file. Each calibrated dataset is
+        written under ``<calibration_key>/<data_key>/``.
     """
     return H5DataCalibrator(
         data_path,
@@ -866,6 +1318,11 @@ def calibrate_h5_file(
         C_ref=C_ref,
         irf_iterations=irf_iterations,
         regularization=regularization,
+        channel_skew_type=channel_skew_type,
+        channel_skew_type_fit_source=channel_skew_type_fit_source,
+        channel_skew_fit_reference_channel=channel_skew_fit_reference_channel,
+        channel_skew_fit_upsampling=channel_skew_fit_upsampling,
+        channel_skew_fit_apodize=channel_skew_fit_apodize,
         overwrite=overwrite,
         **kwargs,
     ).calibrate()
