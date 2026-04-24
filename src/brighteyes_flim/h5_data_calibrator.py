@@ -30,8 +30,8 @@ DEFAULT_FIT_TYPE = "circular"
 DEFAULT_C_REF = 1.0
 DEFAULT_IRF_ITERATIONS = 300
 DEFAULT_REGULARIZATION = 0
-DEFAULT_CHANNEL_SKEW_TYPE = "fit"
-DEFAULT_CHANNEL_SKEW_TYPE_FIT_SOURCE = "ref"
+DEFAULT_CHANNEL_SKEW_TYPE = "phase_cross_correlation"
+DEFAULT_CHANNEL_SKEW_SOURCE = "ref"
 DEFAULT_CHANNEL_SKEW_FIT_REFERENCE_CHANNEL = 12
 DEFAULT_CHANNEL_SKEW_FIT_UPSAMPLING = 10
 DEFAULT_CHANNEL_SKEW_FIT_APODIZE = False
@@ -96,15 +96,16 @@ class H5DataCalibrator:
         Numerical stability constant passed to the fitting routines.
     regularization : float, default ``0``
         Regularization strength used during IRF estimation.
-    channel_skew_type : {"fit"}, default ``"fit"``
-        Strategy used to populate ``channels_time_skew`` outputs. Only
-        ``"fit"`` is currently supported.
-    channel_skew_type_fit_source : {"ref", "irf", "data"} or numpy.ndarray, default ``"ref"``
+    channel_skew_type : {"phase_cross_correlation"}, default ``"phase_cross_correlation"``
+        Strategy used to populate ``channel_skew`` outputs. Only
+        ``"phase_cross_correlation"`` is currently supported.
+    channel_skew_source : {"ref", "irf", "data", "metadata"} or numpy.ndarray, default ``"ref"``
         Source used for channel-skew generation. String values select one of
         the stored calibration histograms, while a 1D NumPy array forces the
-        final ``channels_time_skew`` values directly. When the ``data`` key
-        is present, non-``data`` groups are anchored by default to the
-        selected reference channel from the ``data`` group.
+        final ``channel_skew`` values directly. When the ``data`` key is
+        present, non-``data`` groups are anchored by default to the selected
+        reference channel from the ``data`` group. ``"metadata"`` is reserved
+        and currently raises ``NotImplementedError``.
     channel_skew_fit_reference_channel : int, default ``12``
         Reference channel index used by ``ShiftVectors``. The value is matched
         against the calibrated ``channel_index`` entries for each dataset key.
@@ -150,7 +151,7 @@ class H5DataCalibrator:
         eps=1e-8,
         regularization=DEFAULT_REGULARIZATION,
         channel_skew_type=DEFAULT_CHANNEL_SKEW_TYPE,
-        channel_skew_type_fit_source=DEFAULT_CHANNEL_SKEW_TYPE_FIT_SOURCE,
+        channel_skew_source=DEFAULT_CHANNEL_SKEW_SOURCE,
         channel_skew_fit_reference_channel=DEFAULT_CHANNEL_SKEW_FIT_REFERENCE_CHANNEL,
         channel_skew_fit_upsampling=DEFAULT_CHANNEL_SKEW_FIT_UPSAMPLING,
         channel_skew_fit_apodize=DEFAULT_CHANNEL_SKEW_FIT_APODIZE,
@@ -177,9 +178,7 @@ class H5DataCalibrator:
         self.eps = eps
         self.regularization = regularization
         self.channel_skew_type = self._normalize_channel_skew_type(channel_skew_type)
-        self.channel_skew_type_fit_source = self._normalize_channel_skew_type_fit_source(
-            channel_skew_type_fit_source
-        )
+        self.channel_skew_source = self._normalize_channel_skew_source(channel_skew_source)
         self.channel_skew_fit_reference_channel = int(channel_skew_fit_reference_channel)
         self.channel_skew_fit_upsampling = int(channel_skew_fit_upsampling)
         self.channel_skew_fit_apodize = bool(channel_skew_fit_apodize)
@@ -190,26 +189,26 @@ class H5DataCalibrator:
     @staticmethod
     def _normalize_channel_skew_type(channel_skew_type):
         normalized = str(channel_skew_type).strip().lower()
-        if normalized != "fit":
+        if normalized != "phase_cross_correlation":
             raise NotImplementedError(
-                "channel_skew_type values other than 'fit' are not supported yet"
+                "channel_skew_type values other than 'phase_cross_correlation' are not supported yet"
             )
-        return normalized
+        return "phase_cross_correlation"
 
     @staticmethod
-    def _normalize_channel_skew_type_fit_source(channel_skew_type_fit_source):
-        if isinstance(channel_skew_type_fit_source, np.ndarray):
-            source_array = np.asarray(channel_skew_type_fit_source, dtype=float)
+    def _normalize_channel_skew_source(channel_skew_source):
+        if isinstance(channel_skew_source, np.ndarray):
+            source_array = np.asarray(channel_skew_source, dtype=float)
             if source_array.ndim != 1:
                 raise ValueError(
-                    "channel_skew_type_fit_source array must be 1D with one value per calibrated channel"
+                    "channel_skew_source array must be 1D with one value per calibrated channel"
                 )
             return source_array
 
-        normalized = str(channel_skew_type_fit_source).strip().lower()
-        if normalized not in {"ref", "irf", "data"}:
+        normalized = str(channel_skew_source).strip().lower()
+        if normalized not in {"ref", "irf", "data", "metadata"}:
             raise ValueError(
-                "channel_skew_type_fit_source must be 'ref', 'irf', 'data', or a 1D numpy.ndarray"
+                "channel_skew_source must be 'ref', 'irf', 'data', 'metadata', or a 1D numpy.ndarray"
             )
         return normalized
 
@@ -589,10 +588,10 @@ class H5DataCalibrator:
         return calibration_group.create_group(data_key)
 
     @staticmethod
-    def _channel_skew_source_attr_value(channel_skew_type_fit_source):
-        if isinstance(channel_skew_type_fit_source, np.ndarray):
-            return "array"
-        return str(channel_skew_type_fit_source)
+    def _channel_skew_source_attr_value(channel_skew_source):
+        if isinstance(channel_skew_source, np.ndarray):
+            return "ext"
+        return str(channel_skew_source)
 
     def _resolve_channel_skew_reference_position(self, channel_index, data_key):
         channel_index = np.asarray(channel_index, dtype=int)
@@ -613,19 +612,24 @@ class H5DataCalibrator:
 
     def _validate_channel_skew_configuration(self, channel_index, data_key):
         channel_index = np.asarray(channel_index, dtype=int)
-        source = self.channel_skew_type_fit_source
+        source = self.channel_skew_source
 
         if isinstance(source, np.ndarray):
             if source.shape != (len(channel_index),):
                 raise ValueError(
-                    "channel_skew_type_fit_source array must have shape "
+                    "channel_skew_source array must have shape "
                     f"({len(channel_index)},) for data key {data_key!r}, got {source.shape}"
                 )
             return
 
+        if source == "metadata":
+            raise NotImplementedError(
+                "channel_skew_source='metadata' must still be implemented"
+            )
+
         if source == "ref" and self.reference_type != "ref":
             raise ValueError(
-                f"channel_skew_type_fit_source='ref' is not available for data key {data_key!r} "
+                f"channel_skew_source='ref' is not available for data key {data_key!r} "
                 f"when reference_type={self.reference_type!r}"
             )
 
@@ -666,12 +670,12 @@ class H5DataCalibrator:
     def _compute_channel_skew(self, channel_index, source_histograms, data_key, channel_skew_cache):
         channel_index = np.asarray(channel_index, dtype=int)
         channel_count = int(len(channel_index))
-        source = self.channel_skew_type_fit_source
+        source = self.channel_skew_source
 
         if isinstance(source, np.ndarray):
             if source.shape != (channel_count,):
                 raise ValueError(
-                    "channel_skew_type_fit_source array must have shape "
+                    "channel_skew_source array must have shape "
                     f"({channel_count},) for data key {data_key!r}, got {source.shape}"
                 )
             return (
@@ -681,12 +685,18 @@ class H5DataCalibrator:
                     "reference_data_key": data_key,
                     "reference_channel_resolved": np.nan,
                     "reference_position": np.nan,
+                    "ext_data": np.asarray(source, dtype=float),
                 },
+            )
+
+        if source == "metadata":
+            raise NotImplementedError(
+                "channel_skew_source='metadata' must still be implemented"
             )
 
         if source not in source_histograms:
             raise ValueError(
-                f"channel_skew_type_fit_source={source!r} is not available for data key {data_key!r}"
+                f"channel_skew_source={source!r} is not available for data key {data_key!r}"
             )
 
         calib = self._validate_channel_skew_source_histogram(
@@ -707,7 +717,7 @@ class H5DataCalibrator:
 
         if source not in reference_sources:
             raise ValueError(
-                f"channel_skew_type_fit_source={source!r} is not available in reference data key "
+                f"channel_skew_source={source!r} is not available in reference data key "
                 f"{reference_data_key!r} for data key {data_key!r}"
             )
 
@@ -745,6 +755,7 @@ class H5DataCalibrator:
                 "reference_data_key": reference_data_key,
                 "reference_channel_resolved": reference_channel_resolved,
                 "reference_position": reference_position,
+                "ext_data": None,
             },
         )
 
@@ -782,8 +793,8 @@ class H5DataCalibrator:
                     "initial_C": self.initial_C,
                     "force_C_normalized": self.force_C_normalized,
                     "channel_skew_type": self.channel_skew_type,
-                    "channel_skew_type_fit_source": self._channel_skew_source_attr_value(
-                        self.channel_skew_type_fit_source
+                    "channel_skew_source": self._channel_skew_source_attr_value(
+                        self.channel_skew_source
                     ),
                     "channel_skew_fit_reference_channel": self.channel_skew_fit_reference_channel,
                     "channel_skew_fit_upsampling": self.channel_skew_fit_upsampling,
@@ -853,8 +864,8 @@ class H5DataCalibrator:
                         "initial_C": self.initial_C,
                         "force_C_normalized": self.force_C_normalized,
                         "channel_skew_type": self.channel_skew_type,
-                        "channel_skew_type_fit_source": self._channel_skew_source_attr_value(
-                            self.channel_skew_type_fit_source
+                        "channel_skew_source": self._channel_skew_source_attr_value(
+                            self.channel_skew_source
                         ),
                         "channel_skew_fit_reference_channel": self.channel_skew_fit_reference_channel,
                         "channel_skew_fit_upsampling": self.channel_skew_fit_upsampling,
@@ -1172,8 +1183,8 @@ class H5DataCalibrator:
                     channel_skew_sources["ref"] = ref_common_delay_realigned_stack
 
                 (
-                    channels_time_skew,
-                    channels_time_skew_err,
+                    channel_skew,
+                    channel_skew_est_err,
                     channel_skew_reference_info,
                 ) = self._compute_channel_skew(
                     channel_index_array,
@@ -1190,30 +1201,28 @@ class H5DataCalibrator:
                 target_group.attrs["channel_skew_fit_reference_position"] = (
                     channel_skew_reference_info["reference_position"]
                 )
-                channels_time_skew_in_bins = np.asarray(channels_time_skew, dtype=float)
-                channels_time_skew_err_in_bins = np.asarray(channels_time_skew_err, dtype=float)
-                channels_time_skew_in_ns = channels_time_skew_in_bins * float(dt_ns)
-                channels_time_skew_err_in_ns = channels_time_skew_err_in_bins * float(dt_ns)
+                channel_skew = np.asarray(channel_skew, dtype=float)
+                channel_skew_est_err = np.asarray(channel_skew_est_err, dtype=float)
                 self._replace_dataset(
                     target_group,
-                    "channels_time_skew_in_bins",
-                    channels_time_skew_in_bins,
+                    "channel_skew",
+                    channel_skew,
                 )
                 self._replace_dataset(
                     target_group,
-                    "channels_time_skew_err_in_bins",
-                    channels_time_skew_err_in_bins,
+                    "channel_skew_est_err",
+                    channel_skew_est_err,
                 )
-                self._replace_dataset(
-                    target_group,
-                    "channels_time_skew_in_ns",
-                    channels_time_skew_in_ns,
-                )
-                self._replace_dataset(
-                    target_group,
-                    "channels_time_skew_err_in_ns",
-                    channels_time_skew_err_in_ns,
-                )
+                ext_data = channel_skew_reference_info.get("ext_data")
+                if ext_data is None:
+                    if "channel_skew_ext_data" in target_group:
+                        del target_group["channel_skew_ext_data"]
+                else:
+                    self._replace_dataset(
+                        target_group,
+                        "channel_skew_ext_data",
+                        np.asarray(ext_data, dtype=float),
+                    )
                 string_dtype = h5py.string_dtype(encoding="utf-8")
                 if "irf_type" in target_group:
                     del target_group["irf_type"]
@@ -1248,7 +1257,7 @@ def calibrate_h5_file(
     irf_iterations=DEFAULT_IRF_ITERATIONS,
     regularization=DEFAULT_REGULARIZATION,
     channel_skew_type=DEFAULT_CHANNEL_SKEW_TYPE,
-    channel_skew_type_fit_source=DEFAULT_CHANNEL_SKEW_TYPE_FIT_SOURCE,
+    channel_skew_source=DEFAULT_CHANNEL_SKEW_SOURCE,
     channel_skew_fit_reference_channel=DEFAULT_CHANNEL_SKEW_FIT_REFERENCE_CHANNEL,
     channel_skew_fit_upsampling=DEFAULT_CHANNEL_SKEW_FIT_UPSAMPLING,
     channel_skew_fit_apodize=DEFAULT_CHANNEL_SKEW_FIT_APODIZE,
@@ -1290,15 +1299,18 @@ def calibrate_h5_file(
         Number of iterations used when estimating the IRF.
     regularization : float, default ``0``
         Regularization strength used during IRF estimation.
-    channel_skew_type : {"fit"}, default ``"fit"``
-        Strategy used to generate ``channels_time_skew`` outputs. Only
-        ``"fit"`` is currently supported.
-    channel_skew_type_fit_source : {"ref", "irf", "data"} or numpy.ndarray, default ``"ref"``
+    channel_skew_type : {"phase_cross_correlation"}, default ``"phase_cross_correlation"``
+        Strategy used to generate ``channel_skew`` outputs. Only
+        ``"phase_cross_correlation"`` is currently supported.
+    channel_skew_source : {"ref", "irf", "data", "metadata"} or numpy.ndarray, default ``"ref"``
         Input used for channel-skew generation. String values select a
         calibration histogram, while a 1D NumPy array forces the final
-        ``channels_time_skew`` values directly. When the ``data`` key is
+        ``channel_skew`` values directly. When the ``data`` key is
         present, non-``data`` groups are anchored by default to the selected
-        reference channel from the ``data`` group.
+        reference channel from the ``data`` group. ``"metadata"`` is reserved
+        and currently raises ``NotImplementedError``. If a NumPy array is
+        supplied, the stored HDF5 attribute value becomes ``"ext"`` and the
+        input vector is also written to ``channel_skew_ext_data``.
     channel_skew_fit_reference_channel : int, default ``12``
         Reference channel index used when computing channel skew with
         ``ShiftVectors``. When the default value ``12`` is not present, the
@@ -1335,7 +1347,7 @@ def calibrate_h5_file(
         irf_iterations=irf_iterations,
         regularization=regularization,
         channel_skew_type=channel_skew_type,
-        channel_skew_type_fit_source=channel_skew_type_fit_source,
+        channel_skew_source=channel_skew_source,
         channel_skew_fit_reference_channel=channel_skew_fit_reference_channel,
         channel_skew_fit_upsampling=channel_skew_fit_upsampling,
         channel_skew_fit_apodize=channel_skew_fit_apodize,
