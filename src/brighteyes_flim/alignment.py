@@ -993,10 +993,10 @@ class Alignment:
 
 
     @staticmethod
-    def sum_channel_applying_shifts(data, shifts_array):
+    def sum_channel_applying_shifts(data, shifts_array, axis=(0, 1, 2, 3)):
         """
         Apply fractional cyclic shifts to the channel dimension of histogram data
-        and sum all channels into a single histogram, conserving total counts.
+        and sum all channels, conserving total counts.
 
         Parameters
         ----------
@@ -1015,6 +1015,12 @@ class Alignment:
             Shape: (ch,)
             Fractional shifts (in bin units) applied to each channel.
 
+        axis : int, tuple of int, or None, default (0, 1, 2, 3)
+            Axes to sum after applying the shifts and summing the channel axis.
+            Axes refer to the output array before this final sum, i.e. the
+            input shape without the last channel axis: (rep, z, y, x, bin).
+            Use ``axis=()`` or ``axis=None`` to keep all non-channel axes.
+
         Method
         ------
         - Each histogram along the 'bin' axis is shifted by a fractional amount.
@@ -1022,7 +1028,8 @@ class Alignment:
             each bin contributes to two neighboring bins with weights:
                 (1 - alpha) and alpha
         - Indices are wrapped modulo n_bins → **cyclic behavior**
-        - All channels are then summed into a single histogram.
+        - All channels are then summed.
+        - The selected output axes are summed if ``axis`` is not empty.
 
         Properties
         ----------
@@ -1041,10 +1048,10 @@ class Alignment:
         Returns
         -------
         out : ndarray
-            Output array with shape:
-                (rep, z, y, x, bin)
-
-            i.e. same as input but with channels summed out.
+            Output array with the channel axis removed and with ``axis`` summed.
+            With the default ``axis=(0, 1, 2, 3)``, the output shape is
+            ``(bin,)``. With ``axis=()`` or ``axis=None``, the output shape is
+            ``(rep, z, y, x, bin)``.
 
         Notes
         -----
@@ -1057,6 +1064,8 @@ class Alignment:
         shifts = np.asarray(shifts_array, dtype=float)
 
         *prefix, n_bins, n_hist = data.shape
+        if shifts.shape != (n_hist,):
+            raise ValueError(f"shifts_array must have shape ({n_hist},), got {shifts.shape}")
 
         flat = data.reshape(-1, n_bins, n_hist)  # (B, bin, ch)
         B = flat.shape[0]
@@ -1087,4 +1096,23 @@ class Alignment:
             np.add.at(out[b], j0, w0 * flat_data[b])
             np.add.at(out[b], j1, w1 * flat_data[b])
 
-        return out.reshape(*prefix, n_bins)
+        out = out.reshape(*prefix, n_bins)
+
+        if axis is None:
+            return out
+
+        if np.isscalar(axis):
+            axis = (int(axis),)
+        else:
+            axis = tuple(int(ax) for ax in axis)
+
+        if len(axis) == 0:
+            return out
+
+        ndim = out.ndim
+        normalized_axis = tuple(ax + ndim if ax < 0 else ax for ax in axis)
+        invalid_axis = [ax for ax in normalized_axis if ax < 0 or ax >= ndim]
+        if invalid_axis:
+            raise np.exceptions.AxisError(invalid_axis[0], ndim=ndim)
+
+        return out.sum(axis=normalized_axis)
