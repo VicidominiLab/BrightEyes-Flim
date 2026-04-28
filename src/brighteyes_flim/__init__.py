@@ -32,6 +32,7 @@ model_data = Alignment.model_data
 perform_fit_data = Alignment.perform_fit_data
 phasor_delay_from_hist = Alignment.phasor_delay_from_hist
 rectangular_IRF = Alignment.rectangular_IRF
+sum_channel_applying_shifts = Alignment.sum_channel_applying_shifts
 
 __all__ = [
     "Alignment",
@@ -60,4 +61,5 @@ __all__ = [
     "rectangular_IRF",
     "show_h5_structure",
     "show_h5_structure_html",
+    "sum_channel_applying_shifts",
 ]

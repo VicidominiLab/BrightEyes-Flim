@@ -990,3 +990,101 @@ class Alignment:
     @staticmethod
     def hist_for_plot(hist):
         return Alignment.to_numpy_1d(hist)
+
+
+    @staticmethod
+    def sum_channel_applying_shifts(data, shifts_array):
+        """
+        Apply fractional cyclic shifts to the channel dimension of histogram data
+        and sum all channels into a single histogram, conserving total counts.
+
+        Parameters
+        ----------
+        data : ndarray
+            Input array with shape:
+                (rep, z, y, x, bin, ch)
+            Example:
+                (1, 1, 501, 501, 91, 25)
+
+            - rep: repetitions
+            - z, y, x: spatial dimensions
+            - bin: histogram bins (e.g. 91)
+            - ch: channels to be shifted and summed (e.g. 25)
+
+        shifts_array : ndarray
+            Shape: (ch,)
+            Fractional shifts (in bin units) applied to each channel.
+
+        Method
+        ------
+        - Each histogram along the 'bin' axis is shifted by a fractional amount.
+        - Shifts are applied using **conservative redistribution**:
+            each bin contributes to two neighboring bins with weights:
+                (1 - alpha) and alpha
+        - Indices are wrapped modulo n_bins → **cyclic behavior**
+        - All channels are then summed into a single histogram.
+
+        Properties
+        ----------
+        - ✔ Exact conservation of total counts (photons)
+        - ✔ No negative values introduced
+        - ✔ Sub-bin precision (fractional shifts)
+        - ✔ Cyclic boundary conditions
+
+        Implementation details
+        ----------------------
+        - Leading dimensions (rep, z, y, x) are flattened for batch processing.
+        - All shifts are computed vectorially across channels.
+        - Accumulation uses np.add.at (scatter-add).
+        - A loop over flattened batches remains (NumPy limitation).
+
+        Returns
+        -------
+        out : ndarray
+            Output array with shape:
+                (rep, z, y, x, bin)
+
+            i.e. same as input but with channels summed out.
+
+        Notes
+        -----
+        - Positive shifts move counts toward lower bin indices.
+        To invert direction, change:
+            dst = i - s   -->   dst = i + s
+        """
+
+        data = np.asarray(data, dtype=float)
+        shifts = np.asarray(shifts_array, dtype=float)
+
+        *prefix, n_bins, n_hist = data.shape
+
+        flat = data.reshape(-1, n_bins, n_hist)  # (B, bin, ch)
+        B = flat.shape[0]
+
+        i = np.arange(n_bins)[:, None]           # (bin,1)
+        s = shifts[None, :]                      # (1,ch)
+
+        dst = i - s
+        j0 = np.floor(dst).astype(int)
+        alpha = dst - j0
+        j1 = j0 + 1
+
+        j0 %= n_bins
+        j1 %= n_bins
+
+        # Flatten everything
+        flat_data = flat.reshape(B, -1)          # (B, bin*ch)
+        j0 = j0.reshape(-1)
+        j1 = j1.reshape(-1)
+        alpha = alpha.reshape(-1)
+
+        w0 = (1 - alpha)
+        w1 = alpha
+
+        out = np.zeros((B, n_bins), dtype=float)
+
+        for b in range(B):
+            np.add.at(out[b], j0, w0 * flat_data[b])
+            np.add.at(out[b], j1, w1 * flat_data[b])
+
+        return out.reshape(*prefix, n_bins)
