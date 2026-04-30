@@ -69,6 +69,10 @@ __all__ = [
     "calibrate_phasor",
     "show_lifetime_histogram",
     "plot_flim_image",
+    "build_lifetime_equalizer",
+    "apply_lifetime_equalizer",
+    "equalized_lifetime_tick_values",
+    "show_flim_equalized",
 ]
 
 def correct_phasor(phasor_data, laser_phasor, coeff=1., laser_correction=True):
@@ -871,6 +875,230 @@ def plot_phasor(phasors, bins_2dplot=100, log_scale=True, draw_universal_circle=
     return fig, ax
 
 
+def _finite_bounds(array):
+    finite = np.asarray(array, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return [0.0, 1.0]
+    lower = float(np.min(finite))
+    upper = float(np.max(finite))
+    if np.isclose(lower, upper):
+        upper = lower + 1.0
+    return [lower, upper]
+
+
+def _weighted_quantile(values, quantiles, sample_weight=None):
+    values = np.asarray(values, dtype=float).ravel()
+    quantiles = np.asarray(quantiles, dtype=float)
+    if sample_weight is None:
+        sample_weight = np.ones(values.size, dtype=float)
+    else:
+        sample_weight = np.asarray(sample_weight, dtype=float).ravel()
+        if sample_weight.size != values.size:
+            raise ValueError("sample_weight must match values size")
+    mask = np.isfinite(values) & np.isfinite(sample_weight) & (sample_weight > 0)
+    values = values[mask]
+    sample_weight = sample_weight[mask]
+    if values.size == 0:
+        return np.full_like(quantiles, np.nan, dtype=float)
+    order = np.argsort(values)
+    values = values[order]
+    sample_weight = sample_weight[order]
+    cumulative = np.cumsum(sample_weight)
+    cumulative = (cumulative - 0.5 * sample_weight) / cumulative[-1]
+    return np.interp(
+        np.clip(quantiles, 0.0, 1.0),
+        cumulative,
+        values,
+        left=values[0],
+        right=values[-1],
+    )
+
+
+def build_lifetime_equalizer(reference_lifetime, lifetime_bounds, weights=None, n_quantiles=2048,
+                             strength=1.0, equalization_bins=None):
+    """Build a lifetime-to-equalized-axis mapping from a reference distribution."""
+    low, high = map(float, lifetime_bounds)
+    if np.isclose(low, high):
+        return np.array([low, high + 1.0]), np.array([0.0, 1.0])
+
+    strength = float(strength)
+    if strength <= 0.0:
+        return np.array([low, high]), np.array([0.0, 1.0])
+
+    reference_lifetime = np.asarray(reference_lifetime, dtype=float).ravel()
+    if weights is None:
+        weights = None
+    else:
+        weights = np.asarray(weights, dtype=float).ravel()
+        if weights.size != reference_lifetime.size:
+            raise ValueError("weights must match reference_lifetime size")
+
+    mask = np.isfinite(reference_lifetime)
+    mask &= (reference_lifetime >= low) & (reference_lifetime <= high)
+    if weights is not None:
+        mask &= np.isfinite(weights) & (weights > 0)
+    if not np.any(mask):
+        return np.array([low, high]), np.array([0.0, 1.0])
+
+    if equalization_bins is None:
+        n_bins = max(int(n_quantiles) - 1, 32)
+    else:
+        n_bins = max(int(equalization_bins), 32)
+
+    histogram, edges = np.histogram(
+        reference_lifetime[mask],
+        bins=n_bins,
+        range=(low, high),
+        weights=None if weights is None else weights[mask],
+    )
+    histogram = histogram.astype(float)
+    histogram = np.power(histogram, strength)
+    keep = histogram > 0.0
+    if not np.any(keep):
+        return np.array([low, high]), np.array([0.0, 1.0])
+
+    support = 0.5 * (edges[:-1] + edges[1:])
+    support = support[keep]
+    histogram = histogram[keep]
+    cumulative = np.cumsum(histogram)
+    equalized_axis = (cumulative - 0.5 * histogram) / cumulative[-1]
+    support = np.concatenate(([low], support, [high]))
+    equalized_axis = np.concatenate(([0.0], equalized_axis, [1.0]))
+    return support, equalized_axis
+
+
+def apply_lifetime_equalizer(lifetime, support, equalized_axis):
+    """Map lifetime values onto a precomputed equalized axis."""
+    lifetime = np.asarray(lifetime, dtype=float)
+    clipped = np.clip(lifetime, support[0], support[-1])
+    equalized = np.interp(clipped, support, equalized_axis, left=0.0, right=1.0)
+    equalized[~np.isfinite(lifetime)] = np.nan
+    return equalized
+
+
+def equalized_lifetime_tick_values(reference_lifetime, lifetime_bounds, weights=None, n_ticks=6,
+                                   n_quantiles=2048, strength=1.0, equalization_bins=None):
+    """Return equalized-axis tick positions together with their lifetime labels."""
+    support, equalized_axis = build_lifetime_equalizer(
+        reference_lifetime,
+        lifetime_bounds,
+        weights=weights,
+        n_quantiles=n_quantiles,
+        strength=strength,
+        equalization_bins=equalization_bins,
+    )
+    tick_pos = np.linspace(0.0, 1.0, int(n_ticks))
+    tick_values = np.interp(tick_pos, equalized_axis, support)
+    return tick_pos, tick_values
+
+
+def _equal_luminance_colormap_array(colormap):
+    cmap = plt.get_cmap(colormap)
+    colors = cmap(np.linspace(0.0, 1.0, cmap.N))[:, :3].copy()
+    luminance = (299 * colors[:, 0] + 587 * colors[:, 1] + 114 * colors[:, 2]) / 1000.0
+    max_luminance = np.max(luminance)
+    for idx, lum in enumerate(luminance):
+        if lum <= 0:
+            continue
+        scale = min(max_luminance / lum, 1.0 / max(np.max(colors[idx]), 1e-12))
+        colors[idx] *= scale
+    return colors
+
+
+def _normalize_intensity(image, intensity_bounds):
+    low, high = map(float, intensity_bounds)
+    image = np.asarray(image, dtype=float)
+    clipped = np.clip(image, low, high)
+    normalized = (clipped - low) / max(high - low, np.finfo(float).eps)
+    normalized[~np.isfinite(image)] = 0.0
+    return normalized
+
+
+def _flim_rgb_from_equalized_axis(image, equalized_lifetime, intensity_bounds, colormap):
+    cmap_array = _equal_luminance_colormap_array(colormap)
+    n_colors = cmap_array.shape[0]
+    intensity = _normalize_intensity(image, intensity_bounds)
+    equalized_lifetime = np.asarray(equalized_lifetime, dtype=float)
+    invalid = ~np.isfinite(image) | ~np.isfinite(equalized_lifetime)
+    equalized_lifetime = np.clip(np.nan_to_num(equalized_lifetime, nan=0.0), 0.0, 1.0)
+    idx = np.clip(np.floor(equalized_lifetime * (n_colors - 1)).astype(int), 0, n_colors - 1)
+    rgb = cmap_array[idx] * intensity[..., None]
+    rgb[invalid] = 0.0
+    return rgb
+
+
+def show_flim_equalized(image, lifetime, pxsize, pxdwelltime, lifetime_bounds=None,
+                        intensity_bounds=None, colormap="gist_rainbow", fig=None, ax=None,
+                        equalization_reference=None, equalization_weights=None,
+                        n_quantiles=2048, colorbar_ticks=6, equalization_strength=1.0,
+                        equalization_bins=None):
+    """Show a FLIM image using an equalized lifetime axis for the hue mapping."""
+    from matplotlib_scalebar.scalebar import ScaleBar
+
+    image = np.asarray(image, dtype=float)
+    lifetime = np.asarray(lifetime, dtype=float)
+    pxsize = float(np.asarray(pxsize).squeeze())
+    pxdwelltime = float(np.asarray(pxdwelltime).squeeze())
+
+    if intensity_bounds is None:
+        intensity_bounds = _finite_bounds(image)
+    if lifetime_bounds is None:
+        lifetime_bounds = _finite_bounds(lifetime)
+    if equalization_reference is None:
+        equalization_reference = lifetime
+
+    support, equalized_axis = build_lifetime_equalizer(
+        equalization_reference,
+        lifetime_bounds,
+        weights=equalization_weights,
+        n_quantiles=n_quantiles,
+        strength=equalization_strength,
+        equalization_bins=equalization_bins,
+    )
+    lifetime_equalized = apply_lifetime_equalizer(lifetime, support, equalized_axis)
+    rgb = _flim_rgb_from_equalized_axis(image, lifetime_equalized, intensity_bounds, colormap)
+
+    if fig is None or ax is None:
+        fig, ax = plt.subplots()
+
+    img_extent = (0, image.shape[1] * pxsize, 0, image.shape[0] * pxsize)
+    ax.imshow(rgb, extent=img_extent)
+    ax.axis("off")
+
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes("right", size="5%", pad=0.05)
+    n_bar = 256
+    intensity_gradient = np.linspace(intensity_bounds[0], intensity_bounds[1], n_bar)
+    equalized_gradient = np.linspace(0.0, 1.0, n_bar)
+    intensity_grid = np.tile(intensity_gradient, (n_bar, 1)).T
+    equalized_grid = np.tile(equalized_gradient, (n_bar, 1))
+    rgb_colorbar = _flim_rgb_from_equalized_axis(
+        intensity_grid, equalized_grid, intensity_bounds, colormap
+    )
+    rgb_colorbar = np.moveaxis(rgb_colorbar, 0, 1)
+    cax.imshow(
+        rgb_colorbar,
+        origin="lower",
+        aspect="auto",
+        extent=(intensity_bounds[0], intensity_bounds[1], 0.0, 1.0),
+    )
+    cax.set_xticks([int(intensity_bounds[0]), int(intensity_bounds[1])])
+    cax.set_xlabel(f"Counts/{pxdwelltime} " + "$\\mathregular{\\mu s}$")
+    tick_pos = np.linspace(0.0, 1.0, int(colorbar_ticks))
+    tick_values = np.interp(tick_pos, equalized_axis, support)
+    cax.set_yticks(tick_pos)
+    cax.set_yticklabels([f"{tick:.2f}" for tick in tick_values])
+    cax.set_ylabel("Lifetime (ns, equalized axis)")
+    cax.yaxis.tick_right()
+    cax.yaxis.set_label_position("right")
+
+    scalebar = ScaleBar(1, "um", box_alpha=0, color="w", length_fraction=0.25)
+    ax.add_artist(scalebar)
+    plt.tight_layout()
+    return fig, ax
+
+
 def fourier_shift(data, shift_angle=0.):
     if len(data.shape) == 1:
         w = np.arange(data.shape[0])
@@ -924,6 +1152,12 @@ def correction_phasor(laser, laser_irf):
     angle_laser_irf = np.angle(phasor_laser_irf)
 
     return np.exp(-1j * (angle_laser - angle_laser_irf))
+
+def threshold_intensity(intensity_map, threshold=0.15):
+    max_counts = intensity_map.max()
+    idx = intensity_map > threshold * max_counts
+    thresholded_intensity = intensity_map[idx]
+    return thresholded_intensity
 
 
 def threshold_phasor(intensity_map, phasor_map, threshold=0.15):

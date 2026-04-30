@@ -993,7 +993,7 @@ class Alignment:
 
 
     @staticmethod
-    def sum_channel_applying_shifts(data, shifts_array, axis=(0, 1, 2, 3)):
+    def sum_channel_applying_shifts(data, shifts_array, axis=(0, 1, 2, 3), reverse_shifts=True):
         """
         Apply fractional cyclic shifts to the channel dimension of histogram data
         and sum all channels, conserving total counts.
@@ -1062,6 +1062,8 @@ class Alignment:
 
         data = np.asarray(data, dtype=float)
         shifts = np.asarray(shifts_array, dtype=float)
+        if reverse_shifts:
+            shifts = -shifts
 
         *prefix, n_bins, n_hist = data.shape
         if shifts.shape != (n_hist,):

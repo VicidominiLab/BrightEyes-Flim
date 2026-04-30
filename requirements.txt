@@ -1,1 +1,1 @@
-brighteyes-ism>=1.4.1
+brighteyes-ism>=1.4.3

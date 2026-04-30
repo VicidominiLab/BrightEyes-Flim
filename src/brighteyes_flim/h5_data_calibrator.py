@@ -329,7 +329,7 @@ class H5DataCalibrator:
         if nbin is None:
             metadata_nbin = H5DataCalibrator._metadata_get(metadata, "dfd_nbins")
             if metadata_nbin is None:
-                raise ValueError("metadata must provide dfd_nbins or nbin must be passed explicitly")
+                raise ValueError("metadata must provide dfd_nbins or nbin must be passed explicitly as it was not possible to obtain automatically")
             nbin = int(metadata_nbin)
         else:
             nbin = int(nbin)
@@ -340,7 +340,7 @@ class H5DataCalibrator:
         if period_ns is None:
             dfd_freq_MHz = H5DataCalibrator._metadata_get(metadata, "dfd_freq")
             if dfd_freq_MHz is None:
-                raise ValueError("metadata must provide dfd_freq or period_ns must be passed explicitly")
+                raise ValueError("metadata must provide dfd_freq or period_ns must be passed explicitly as it was not possible to obtain automatically")
             dfd_freq_MHz = float(dfd_freq_MHz)
             if not np.isfinite(dfd_freq_MHz) or dfd_freq_MHz <= 0:
                 raise ValueError("metadata.dfd_freq must be a positive finite value")
