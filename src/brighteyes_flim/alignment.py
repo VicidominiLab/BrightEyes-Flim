@@ -899,7 +899,8 @@ class Alignment:
             initial_guess[2] = initial_tau
 
         
-        sigma = np.sqrt(data_hist)
+        #sigma = np.sqrt(data_hist)
+        sigma = np.sqrt(np.clip(data_hist, 1.0, None)) / data_sum
         tau_lower_bound = float(irf_min)
         if tau_lower_bound <= 0:
             raise ValueError("irf_min must be positive")
