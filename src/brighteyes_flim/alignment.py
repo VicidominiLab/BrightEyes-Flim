@@ -4,6 +4,7 @@ import warnings
 
 import numpy as np
 from scipy.ndimage import shift
+from tqdm.auto import tqdm
 try:
     from scipy import optimize as scipy_optimize
 except ImportError:  # pragma: no cover - optional dependency
@@ -70,6 +71,63 @@ class Alignment:
             )
             return np.zeros_like(hist, dtype=float)
         return hist / total
+
+    @staticmethod
+    def centroid(data):
+        """Return the intensity-weighted centroid index of a 1D histogram."""
+        hist = Alignment.to_numpy_1d(data, dtype=float)
+        total = np.sum(hist)
+        if not np.isfinite(total) or total <= 0:
+            return np.nan
+        return float(np.sum(np.arange(hist.size, dtype=float) * hist) / total)
+
+    @staticmethod
+    def clean_irf(irf, threshold=0.3, window=6):
+        """
+        Keep only the IRF samples around the thresholded centroid.
+
+        ``threshold`` is interpreted in the same units as ``irf``. Normalize the
+        input first when using fractional thresholds such as ``0.3``.
+        ``window`` is expressed in histogram bins.
+        """
+        hist = Alignment.to_numpy_1d(irf, dtype=float)
+        time = np.arange(hist.size, dtype=float)
+        thresholded = np.where(hist > float(threshold), hist, 0.0)
+        center = Alignment.centroid(thresholded)
+        cleaned = np.zeros_like(hist, dtype=float)
+        if not np.isfinite(center):
+            return cleaned
+
+        keep = (time > center - float(window)) & (time < center + float(window))
+        cleaned[keep] = hist[keep]
+        return cleaned
+
+    @staticmethod
+    def clean_irf_stack(irf, threshold=0.3, window=6, time_axis=0, normalize=False):
+        """
+        Apply :meth:`clean_irf` along the time axis of an IRF stack.
+
+        Parameters are the same as :meth:`clean_irf`. If ``normalize=True``, each
+        trace is divided by its finite positive maximum before thresholding and
+        the normalized trace is returned, matching the historical notebook use.
+        """
+        irf_array = np.asarray(irf, dtype=float)
+        moved = np.moveaxis(irf_array, time_axis, 0)
+        flat = moved.reshape(moved.shape[0], -1)
+        cleaned = np.empty_like(flat, dtype=float)
+
+        for idx in range(flat.shape[1]):
+            trace = flat[:, idx]
+            if normalize:
+                trace_max = np.nanmax(trace)
+                if np.isfinite(trace_max) and trace_max > 0:
+                    trace = trace / trace_max
+                else:
+                    trace = np.zeros_like(trace, dtype=float)
+            cleaned[:, idx] = Alignment.clean_irf(trace, threshold=threshold, window=window)
+
+        cleaned = cleaned.reshape(moved.shape)
+        return np.moveaxis(cleaned, 0, time_axis)
 
     @staticmethod
     def _wrap_to_period(x, period, center=0.0):
@@ -1247,6 +1305,187 @@ class Alignment:
 
         popt = Alignment._restore_seeded_dT(popt, dT_seed_bins, nbin)
         return {"C": popt[0], "dT": popt[1], "tau": popt[2]}, cov
+
+    @staticmethod
+    def _fit_map_covariance_errors(covariance):
+        covariance = np.asarray(covariance, dtype=float)
+        errors = np.full(3, np.nan, dtype=float)
+        if covariance.shape != (3, 3):
+            return errors
+
+        diag = np.diag(covariance)
+        valid = np.isfinite(diag) & (diag >= 0)
+        errors[valid] = np.sqrt(diag[valid])
+        return errors
+
+    @staticmethod
+    def _fit_map_one_pixel(
+        flat_idx,
+        hist,
+        nx,
+        t,
+        irf,
+        period,
+        initial_tau,
+        initial_dT,
+        initial_C,
+        mode,
+        fit_type,
+        force_C_normalized,
+        catch_exceptions,
+    ):
+        y = int(flat_idx // nx)
+        x = int(flat_idx % nx)
+        hist = np.asarray(hist, dtype=float)
+
+        try:
+            fit_res, cov = Alignment.perform_fit_data(
+                t=t,
+                data=hist,
+                irf=irf,
+                period=period,
+                initial_tau=initial_tau,
+                initial_dT=initial_dT,
+                initial_C=initial_C,
+                mode=mode,
+                fit_type=fit_type,
+                force_C_normalized=force_C_normalized,
+            )
+            errors = Alignment._fit_map_covariance_errors(cov)
+            return (
+                y,
+                x,
+                float(fit_res["C"]),
+                float(fit_res["dT"]),
+                float(fit_res["tau"]),
+                float(errors[0]),
+                float(errors[1]),
+                float(errors[2]),
+            )
+        except Exception:
+            if not catch_exceptions:
+                raise
+            return (y, x, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan)
+
+    @staticmethod
+    def generate_fit_maps(
+        data,
+        irf,
+        t,
+        period,
+        initial_tau=None,
+        initial_dT=None,
+        initial_C=None,
+        mode="irf_shift",
+        fit_type="likelihood",
+        force_C_normalized=True,
+        min_counts=0.0,
+        valid_mask=None,
+        n_jobs=1,
+        backend="loky",
+        show_progress=True,
+        catch_exceptions=True,
+    ):
+        """
+        Fit every pixel histogram in a ``(y, x, t)`` image and return fit maps.
+
+        Returns a dictionary with ``C``, ``dT``, ``tau``, ``C_err``,
+        ``dT_err``, and ``tau_err`` maps. Invalid or failed pixels are filled
+        with NaNs.
+        """
+        data_array = np.asarray(data, dtype=float)
+        irf_hist = Alignment.to_numpy_1d(irf, dtype=float)
+        t_ns = Alignment.to_numpy_1d(t, dtype=float)
+
+        if data_array.ndim != 3:
+            raise ValueError(f"data must have shape (ny, nx, nbins), got {data_array.shape}")
+
+        ny, nx, nbins = data_array.shape
+        if irf_hist.shape != (nbins,):
+            raise ValueError(f"irf must have shape ({nbins},), got {irf_hist.shape}")
+        if t_ns.shape != (nbins,):
+            raise ValueError(f"t must have shape ({nbins},), got {t_ns.shape}")
+        if not np.all(np.isfinite(t_ns)):
+            raise ValueError("t contains non-finite values")
+        if not np.all(np.isfinite(irf_hist)) or np.sum(irf_hist) <= 0:
+            raise ValueError("irf contains non-finite values or has non-positive sum")
+
+        data_2d = data_array.reshape(-1, nbins)
+        pixel_is_valid = (
+            np.all(np.isfinite(data_2d), axis=1)
+            & (np.sum(data_2d, axis=1) > float(min_counts))
+        )
+
+        if valid_mask is not None:
+            valid_mask = np.asarray(valid_mask, dtype=bool)
+            if valid_mask.shape == (ny, nx):
+                valid_mask = valid_mask.ravel()
+            elif valid_mask.shape != (ny * nx,):
+                raise ValueError(
+                    f"valid_mask must have shape {(ny, nx)} or {(ny * nx,)}, got {valid_mask.shape}"
+                )
+            pixel_is_valid &= valid_mask
+
+        valid_indices = np.flatnonzero(pixel_is_valid)
+
+        fit_maps = {
+            "C": np.full((ny, nx), np.nan, dtype=float),
+            "dT": np.full((ny, nx), np.nan, dtype=float),
+            "tau": np.full((ny, nx), np.nan, dtype=float),
+            "C_err": np.full((ny, nx), np.nan, dtype=float),
+            "dT_err": np.full((ny, nx), np.nan, dtype=float),
+            "tau_err": np.full((ny, nx), np.nan, dtype=float),
+        }
+
+        if valid_indices.size == 0:
+            return fit_maps
+
+        progress = tqdm if show_progress else (lambda x, **kwargs: x)
+        worker_kwargs = dict(
+            nx=nx,
+            t=t_ns,
+            irf=irf_hist,
+            period=float(period),
+            initial_tau=initial_tau,
+            initial_dT=initial_dT,
+            initial_C=initial_C,
+            mode=mode,
+            fit_type=fit_type,
+            force_C_normalized=force_C_normalized,
+            catch_exceptions=catch_exceptions,
+        )
+
+        if int(n_jobs) == 1:
+            results = [
+                Alignment._fit_map_one_pixel(int(idx), data_2d[int(idx)], **worker_kwargs)
+                for idx in progress(valid_indices, desc="Fitting pixels")
+            ]
+        else:
+            try:
+                from joblib import Parallel, delayed
+            except ImportError as exc:  # pragma: no cover - optional dependency
+                raise ImportError("joblib is required when n_jobs is not 1") from exc
+
+            results = Parallel(n_jobs=n_jobs, backend=backend, verbose=0)(
+                delayed(Alignment._fit_map_one_pixel)(int(idx), data_2d[int(idx)], **worker_kwargs)
+                for idx in progress(valid_indices, desc="Fitting pixels")
+            )
+
+        for y, x, C, dT, tau, C_err, dT_err, tau_err in results:
+            fit_maps["C"][y, x] = C
+            fit_maps["dT"][y, x] = dT
+            fit_maps["tau"][y, x] = tau
+            fit_maps["C_err"][y, x] = C_err
+            fit_maps["dT_err"][y, x] = dT_err
+            fit_maps["tau_err"][y, x] = tau_err
+
+        return fit_maps
+
+    @staticmethod
+    def fit_maps_to_stack(fit_maps, names=("C", "dT", "tau", "C_err", "dT_err", "tau_err")):
+        """Return a stack and name list from a fit-map dictionary."""
+        names = list(names)
+        return np.stack([np.asarray(fit_maps[name], dtype=float) for name in names], axis=0), names
 
     @staticmethod
     def phasor_delay_from_hist(hist, period_ns, harmonic=1):
