@@ -1,0 +1,244 @@
+Speed-up plan for LaminaTubolin_fit_UNFINISHED.ipynb pixel fitting
+====================================================================
+
+Context inspected
+-----------------
+
+The slow cell is the notebook cell that fits every valid pixel:
+
+    results = Parallel(n_jobs=n_jobs, backend="loky", verbose=0)(
+        delayed(fit_one_pixel)(idx)
+        for idx in tqdm(valid_indices, desc="Fitting pixels")
+    )
+
+The saved notebook shows:
+
+    data_summed.shape = (1250, 1250, 81)
+    irf_summed.shape = (81,)
+    valid pixels = 1,562,500 / 1,562,500
+    mode = "irf_shift"
+    fit_type = "likelihood"
+    force_C_normalized = True
+
+So this is 1.56 million independent 2-parameter nonlinear optimizations
+for dT and tau, each on only 81 time bins.
+
+Main bottleneck
+---------------
+
+This is not mainly a "joblib is bad" problem. It is mostly an algorithm
+and per-fit overhead problem:
+
+1. Each pixel calls scipy.optimize.least_squares.
+2. Each optimizer calls the residual function many times.
+3. Each residual calls Alignment.fit_model_data.
+4. Alignment.fit_model_data currently converts small 81-bin NumPy arrays to
+   Torch tensors and runs a tiny FFT convolution.
+5. For 81 bins, repeatedly entering Python, SciPy, Torch, FFT setup, and
+   possible device transfers dominates the useful math.
+6. The joblib call also creates/collects 1.56 million result tuples, which adds
+   scheduling and memory overhead.
+
+Important GPU conclusion
+------------------------
+
+PyTorch GPU is not a direct win for the current function.
+
+SciPy's least_squares is CPU-side. If the residual calls Torch on GPU, SciPy
+still asks for one tiny 81-bin residual at a time and then needs the result back
+on CPU as a NumPy array. That pattern is usually slower than CPU because GPU
+launch and transfer overhead dominate.
+
+GPU becomes useful only after changing the algorithm to process many pixels and
+many candidate models in large batches, for example a vectorized grid search or
+a Torch/JAX-native batched optimizer.
+
+Best immediate plan, no model rewrite
+-------------------------------------
+
+1. Benchmark first on a small random subset.
+
+   Add a timing cell before the full fit:
+
+       import time
+       sample = np.random.default_rng(0).choice(valid_indices, size=2000, replace=False)
+       t0 = time.perf_counter()
+       _ = [fit_one_pixel(idx) for idx in sample[:100]]
+       print("serial 100 pixels:", time.perf_counter() - t0)
+
+       for jobs in [4, 8, 12, 16, 24, -1]:
+           t0 = time.perf_counter()
+           _ = Parallel(n_jobs=jobs, backend="loky", batch_size=64)(
+               delayed(fit_one_pixel)(idx) for idx in sample
+           )
+           print(jobs, "jobs, 2000 pixels:", time.perf_counter() - t0)
+
+   Do not assume n_jobs=-1 is fastest. With small fits it often oversubscribes
+   BLAS/OpenMP threads and loses.
+
+2. Limit numeric-library thread oversubscription before importing NumPy/SciPy.
+
+   Put this at the top of the notebook/kernel before imports:
+
+       import os
+       os.environ["OMP_NUM_THREADS"] = "1"
+       os.environ["OPENBLAS_NUM_THREADS"] = "1"
+       os.environ["MKL_NUM_THREADS"] = "1"
+       os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+   Then restart the kernel. Use joblib processes for parallelism, not nested
+   BLAS threads.
+
+3. Reduce joblib task count by fitting chunks, not individual pixels.
+
+   Replace 1.56M tiny joblib tasks with maybe 200-1000 chunk tasks:
+
+       def fit_pixel_chunk(indices):
+           out = np.empty((len(indices), 7), dtype=float)
+           for j, flat_idx in enumerate(indices):
+               out[j] = fit_one_pixel(int(flat_idx))
+           return out
+
+       chunks = np.array_split(valid_indices, max(1, len(valid_indices) // 4096))
+       chunk_results = Parallel(
+           n_jobs=n_jobs,
+           backend="loky",
+           batch_size=1,
+           verbose=5,
+       )(
+           delayed(fit_pixel_chunk)(chunk)
+           for chunk in tqdm(chunks, desc="Fitting chunks")
+       )
+
+       results = np.vstack(chunk_results)
+
+   Then fill maps from the columns of results. This reduces scheduler overhead
+   and Python object memory pressure.
+
+4. Replace the per-evaluation Torch convolution with a NumPy CPU path.
+
+   For this specific least_squares workflow, a pure NumPy/SciPy model is likely
+   faster than Torch because the vectors are tiny and SciPy wants NumPy arrays.
+   Add a NumPy-only helper for 1D circular convolution and use that in the
+   fitting residual. The current Torch path is more useful for larger tensor
+   operations, not millions of tiny scalar fits.
+
+   Candidate implementation idea:
+
+       conv = np.fft.ifft(np.fft.fft(model) * np.fft.fft(shifted_irf)).real
+       conv = np.fft.ifftshift(conv)
+
+   Verify against Alignment.fit_model_data on a few pixels before using it,
+   because the exact shift convention matters.
+
+5. Tighten optimizer settings.
+
+   The current max_nfev=600000 is effectively unbounded. For a 2-parameter
+   per-pixel fit, start with max_nfev around 100-300 and compare fitted maps.
+   Add tolerances explicitly, for example:
+
+       scipy.optimize.least_squares(..., max_nfev=200, x_scale="jac")
+
+   Also consider narrower tau bounds if biologically reasonable, for example
+   tau 0.1..8 ns instead of 1e-5..t.max().
+
+6. Use better initial guesses.
+
+   Current initial_tau=1.0 and initial_dT=1.0 are global constants. Better
+   seeds can reduce least_squares iterations a lot:
+
+   - dT seed: peak difference or phasor phase delay per pixel.
+   - tau seed: phasor tau_m/tau_phi map or a low-resolution fit map.
+   - spatial warm start: fit a downsampled/binned image first, interpolate tau
+     and dT maps, then use per-pixel initial guesses.
+
+   This requires allowing fit_one_pixel to read initial_tau_map[y, x] and
+   initial_dT_map[y, x].
+
+7. Do not fit useless low-count pixels.
+
+   The notebook currently accepts every nonzero pixel. Add an intensity
+   threshold and leave low-count pixels as NaN or fill them with a fast phasor
+   estimate. Example:
+
+       intensity = data_flat.sum(axis=1)
+       valid_mask = np.all(np.isfinite(data_flat), axis=1) & (intensity >= 20)
+
+   The correct threshold depends on the photon counts and desired noise level.
+
+Best bigger plan, if you want real acceleration
+-----------------------------------------------
+
+Implement a batched candidate-model fitter.
+
+Because C is fixed to 1 and the model is normalized, the Poisson negative
+log-likelihood for candidate model probability p is basically:
+
+    score(pixel, model) = -sum_b counts[pixel, b] * log(p[model, b])
+
+up to constants independent of the model.
+
+That means many fits can be converted from 1.56 million nonlinear optimizers
+into matrix multiplications:
+
+1. Build a grid of candidate tau values and dT values.
+2. For each candidate, compute the normalized IRF-convolved model p[model, bin].
+3. Precompute log_p = log(p clipped above zero).
+4. For chunks of pixels, compute scores = -counts_chunk @ log_p.T.
+5. Pick argmin score per pixel.
+6. Optionally refine only around the best grid point with a small local
+   optimizer for high-quality pixels.
+
+This is where GPU helps:
+
+    counts_chunk_torch @ log_p_torch.T
+
+is a large dense operation and uses the GPU efficiently. It also works very well
+on CPU BLAS if GPU is unavailable.
+
+Expected benefit: usually one to two orders of magnitude faster than calling
+least_squares 1.56 million times, depending on grid size and refinement.
+
+Recommended development sequence
+--------------------------------
+
+Phase 1: notebook-only quick win
+
+1. Add the benchmark cell.
+2. Set BLAS/OpenMP env vars and restart kernel.
+3. Switch joblib from pixel tasks to chunk tasks.
+4. Tune n_jobs using the benchmark; likely 8-16, not necessarily -1.
+5. Add an intensity threshold.
+
+Phase 2: exact-ish CPU fitter cleanup
+
+1. Add a NumPy-only fit_model_data path used by SciPy residuals.
+2. Reduce max_nfev and add reasonable tau bounds.
+3. Add phasor/downsampled warm-start maps.
+4. Compare maps and histograms against the current method on a 100x100 ROI.
+
+Phase 3: high-speed batched fitter
+
+1. Implement a grid-search likelihood function for (dT, tau).
+2. Use NumPy first for correctness.
+3. Add optional Torch backend:
+
+       device = "cuda" if torch.cuda.is_available() else "cpu"
+
+4. Process pixels in chunks sized to memory, e.g. 4096-65536 pixels.
+5. Return tau_map, dT_map, and optionally score/confidence maps.
+6. Refine with least_squares only for selected pixels if needed.
+
+Practical recommendation
+------------------------
+
+For the current notebook, start with CPU, not GPU:
+
+1. chunk joblib tasks,
+2. cap numeric threads,
+3. use 8-16 workers,
+4. avoid Torch inside SciPy residuals,
+5. add better initial guesses and lower max_nfev.
+
+Use PyTorch GPU only for a redesigned batched grid/search fitter. The current
+SciPy-per-pixel architecture cannot feed the GPU enough work per call.

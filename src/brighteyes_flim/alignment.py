@@ -480,7 +480,7 @@ class Alignment:
         C_ref=1.0,
         irf_output="original",
         shift_output=None,
-        fit_type="circular",
+        fit_type="likelihood",
         mode="irf_shift",
         initial_tau=None,
         initial_dT=None,
@@ -512,6 +512,12 @@ class Alignment:
             Directly provided IRF. When this is given, ``tau_ref`` is ignored.
         C_ref : float, default 1.0
             Reference amplitude used during IRF estimation from ``ref``.
+        fit_type : {"likelihood", "curve_fit_circular", "curve_fit"}, default "likelihood"
+            Fitting backend used by ``perform_fit_data``. ``"likelihood"``
+            uses Poisson likelihood/deviance residuals and is recommended
+            for low-count per-pixel histograms. ``"curve_fit_circular"`` keeps
+            the circular-parameter sigma-weighted least-squares behavior, while
+            ``"curve_fit"`` uses SciPy's standard ``curve_fit``.
         irf_output : {"original", "shifted"}, default "original"
             Controls the returned ``irf`` in the result dictionary.
             - ``"original"`` returns the estimated IRF (if ``ref`` was used) or
@@ -733,33 +739,48 @@ class Alignment:
         Units:
         - ``t`` and ``period`` are in nanoseconds.
         - ``tau`` is in nanoseconds.
-        - ``dT`` is in histogram bins, because it is applied through
-          ``scipy.ndimage.shift(..., mode='grid-wrap')``.
+        - ``dT`` is in histogram bins. In ``"irf_shift"`` mode it shifts the
+          IRF; in ``"model_shift"`` mode it shifts the mono-exponential model.
         """
         t_ns = Alignment.to_numpy_1d(t, dtype=float)
         irf_hist = Alignment.to_numpy_1d(irf, dtype=float)
         C_norm = float(C)
-        dT_bins = float(dT) 
+        dT_bins = float(dT)
         tau_ns = float(tau)
         period_ns = float(period)
 
-        if mode=="model_shift":
-            pure_model_hist = Alignment.model_data(t=t_ns, C=C_norm, tau=tau_ns, period=period_ns, shift_bins=dT_bins)                                                  
-            irf_shifted_hist = irf_hist   
-        elif mode=="irf_shift":
-            pure_model_hist = Alignment.model_data(t=t_ns, C=C_norm, tau=tau_ns, period=period_ns)                                                  
-            irf_shifted_hist = shift(irf_hist, dT_bins, order=1, mode='grid-wrap')
+        if mode == "model_shift":
+            pure_model_hist = Alignment.model_data(
+                t=t_ns,
+                C=C_norm,
+                tau=tau_ns,
+                period=period_ns,
+                shift_bins=dT_bins,
+            )
+            fit_irf_hist = irf_hist
+        elif mode == "irf_shift":
+            pure_model_hist = Alignment.model_data(
+                t=t_ns,
+                C=C_norm,
+                tau=tau_ns,
+                period=period_ns,
+            )
+            fit_irf_hist = shift(irf_hist, dT_bins, order=1, mode="grid-wrap")
         else:
             raise ValueError(f"Unsupported mode: {mode}. Supported model_shift, irf_shift")
-        
-        pure_model_hist = pure_model_hist / pure_model_hist.sum()
-        irf_shifted_hist = irf_shifted_hist / irf_shifted_hist.sum()
 
+        pure_model_hist = pure_model_hist / pure_model_hist.sum()
+        fit_irf_hist = fit_irf_hist / fit_irf_hist.sum()
 
         pure_model_hist = Alignment.to_torch_1d(pure_model_hist)
-        irf_shifted_hist = Alignment.to_torch_1d(irf_shifted_hist)
+        fit_irf_hist = Alignment.to_torch_1d(fit_irf_hist)
         return Alignment.partial_convolution_fft(
-            pure_model_hist, irf_shifted_hist, dim1='t', dim2='t', axis='t', fourier=(0, 0)
+            pure_model_hist,
+            fit_irf_hist,
+            dim1="t",
+            dim2="t",
+            axis="t",
+            fourier=(0, 0),
         )
 
     @staticmethod
@@ -789,6 +810,329 @@ class Alignment:
         )
 
     @staticmethod
+    def _nan_fit_result():
+        return {
+            "C": np.nan,
+            "dT": np.nan,
+            "tau": np.nan,
+        }, np.full((3, 3), np.nan, dtype=float)
+
+    @staticmethod
+    def _skip_fit_with_warning(histogram_name):
+        warnings.warn(
+            f"{histogram_name} histogram has a non-positive or non-finite sum; "
+            "skipping fit and returning NaNs",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return Alignment._nan_fit_result()
+
+    @staticmethod
+    def _canonical_fit_type(fit_type):
+        fit_type_aliases = {
+            "likelihood": "likelihood",
+            "poisson": "likelihood",
+            "poisson_likelihood": "likelihood",
+            "poisson-likelihood": "likelihood",
+            "poisson_deviance": "likelihood",
+            "mle": "likelihood",
+            "curve_fit_circular": "curve_fit_circular",
+            "curve-fit-circular": "curve_fit_circular",
+            "circular_curve_fit": "curve_fit_circular",
+            "circular": "curve_fit_circular",
+            "curve_fit": "curve_fit",
+            "curve-fit": "curve_fit",
+            "weighted_ls": "curve_fit_circular",
+            "weighted-least-squares": "curve_fit_circular",
+            "weighted_least_squares": "curve_fit_circular",
+            "neyman": "curve_fit_circular",
+            "chi_square": "curve_fit_circular",
+            "chisquare": "curve_fit_circular",
+        }
+        fit_type = str(fit_type).strip().lower()
+        if fit_type not in fit_type_aliases:
+            raise ValueError(
+                "Unsupported fit_type: "
+                f"{fit_type}. Supported likelihood, curve_fit_circular, curve_fit"
+            )
+        return fit_type_aliases[fit_type]
+
+    @staticmethod
+    def _fit_initial_guess(initial_C, initial_dT, initial_tau):
+        initial_guess = [1.0, 0.0, 1.0]
+        if initial_C is not None:
+            initial_guess[0] = initial_C
+        if initial_dT is not None:
+            initial_guess[1] = initial_dT
+        if initial_tau is not None:
+            initial_guess[2] = initial_tau
+        return initial_guess
+
+    @staticmethod
+    def _prepare_fit_irf(data_hist_norm, irf_hist_norm, initial_dT):
+        """
+        Optionally pre-shift the IRF so the optimizer fits a small residual dT.
+        """
+        if initial_dT is not None:
+            return irf_hist_norm, initial_dT, None
+
+        dT_seed_bins = Alignment.estimate_peak_dT_bins(data_hist_norm, irf_hist_norm)
+        fit_irf_hist_norm = np.asarray(
+            shift(irf_hist_norm, dT_seed_bins, order=1, mode="grid-wrap"),
+            dtype=float,
+        )
+        fit_irf_hist_norm = fit_irf_hist_norm / fit_irf_hist_norm.sum()
+        return fit_irf_hist_norm, 0.0, dT_seed_bins
+
+    @staticmethod
+    def _full_fit_bounds(nbin, tau_lower_bound, tau_upper_bound):
+        return (
+            [0.0, -nbin / 2, tau_lower_bound],
+            [np.inf, nbin / 2, tau_upper_bound],
+        )
+
+    @staticmethod
+    def _fixed_c_fit_bounds(nbin, tau_lower_bound, tau_upper_bound):
+        return (
+            [-nbin / 2, tau_lower_bound],
+            [nbin / 2, tau_upper_bound],
+        )
+
+    @staticmethod
+    def _expand_fixed_c_fit(popt_fixed_c, cov_fixed_c):
+        popt = np.array([1.0, popt_fixed_c[0], popt_fixed_c[1]], dtype=float)
+        cov = np.full((3, 3), np.nan, dtype=float)
+        cov[1:, 1:] = cov_fixed_c
+        return popt, cov
+
+    @staticmethod
+    def _normalized_model_probability(fit_model_numpy, t_ns, dT_bins, tau_ns):
+        model_hist = fit_model_numpy(t_ns, 1.0, dT_bins, tau_ns)
+        model_hist = np.asarray(model_hist, dtype=float)
+        model_hist = np.clip(model_hist, 1e-15, None)
+        model_sum = model_hist.sum()
+        if not np.isfinite(model_sum) or model_sum <= 0:
+            return None
+        return model_hist / model_sum
+
+    @staticmethod
+    def _poisson_deviance_residual(observed_counts, model_counts):
+        observed_counts = np.asarray(observed_counts, dtype=float)
+        model_counts = np.clip(np.asarray(model_counts, dtype=float), 1e-12, None)
+
+        deviance = model_counts.copy()
+        positive_counts = observed_counts > 0
+        deviance[positive_counts] = (
+            observed_counts[positive_counts]
+            * np.log(observed_counts[positive_counts] / model_counts[positive_counts])
+            - (observed_counts[positive_counts] - model_counts[positive_counts])
+        )
+        deviance = np.maximum(deviance, 0.0)
+        return np.sign(observed_counts - model_counts) * np.sqrt(2.0 * deviance)
+
+    @staticmethod
+    def _covariance_from_least_squares(result, n_observations, n_params, scale_by_cost=False):
+        _, s, vt = np.linalg.svd(result.jac, full_matrices=False)
+        threshold = (
+            np.finfo(float).eps * max(result.jac.shape) * s[0]
+            if s.size
+            else 0.0
+        )
+        s = s[s > threshold]
+        vt = vt[: s.size]
+        pcov = (
+            np.dot(vt.T / (s ** 2), vt)
+            if s.size
+            else np.full((n_params, n_params), np.inf)
+        )
+        if scale_by_cost:
+            dof = max(0, n_observations - n_params)
+            if dof > 0:
+                pcov *= 2.0 * result.cost / dof
+        return pcov
+
+    @staticmethod
+    def _run_poisson_fit(
+        fit_model_numpy,
+        t_ns,
+        data_hist,
+        data_sum,
+        initial_guess,
+        nbin,
+        tau_lower_bound,
+        force_C_normalized,
+    ):
+        tau_upper_bound = t_ns.max()
+
+        if force_C_normalized:
+            def residual(params):
+                dT_bins, tau_ns = params
+                model_probability = Alignment._normalized_model_probability(
+                    fit_model_numpy,
+                    t_ns,
+                    dT_bins,
+                    tau_ns,
+                )
+                if model_probability is None:
+                    return np.full_like(data_hist, 1e12, dtype=float)
+                return Alignment._poisson_deviance_residual(
+                    observed_counts = data_hist,
+                    model_counts = data_sum * model_probability,
+                )
+
+            p0 = initial_guess[1:]
+            bounds = Alignment._fixed_c_fit_bounds(nbin, tau_lower_bound, tau_upper_bound)
+            result = scipy_optimize.least_squares(
+                residual,
+                p0,
+                bounds=bounds,
+                max_nfev=600000,
+            )
+            if not result.success:
+                raise RuntimeError(f"poisson fit failed: {result.message}")
+
+            cov_fixed_c = Alignment._covariance_from_least_squares(
+                result,
+                n_observations=len(data_hist),
+                n_params=len(p0),
+                scale_by_cost=False,
+            )
+            return Alignment._expand_fixed_c_fit(result.x, cov_fixed_c)
+
+        def residual(params):
+            C_norm, dT_bins, tau_ns = params
+            model_probability = Alignment._normalized_model_probability(
+                fit_model_numpy,
+                t_ns,
+                dT_bins,
+                tau_ns,
+            )
+            if model_probability is None:
+                return np.full_like(data_hist, 1e12, dtype=float)
+            model_counts = data_sum * np.clip(C_norm, 1e-12, None) * model_probability
+            return Alignment._poisson_deviance_residual(
+                observed_counts = data_hist,
+                model_counts = model_counts)
+
+        bounds = Alignment._full_fit_bounds(nbin, tau_lower_bound, tau_upper_bound)
+        result = scipy_optimize.least_squares(
+            residual,
+            initial_guess,
+            bounds=bounds,
+            max_nfev=600000,
+        )
+        if not result.success:
+            raise RuntimeError(f"poisson fit failed: {result.message}")
+
+        cov = Alignment._covariance_from_least_squares(
+            result,
+            n_observations=len(data_hist),
+            n_params=len(initial_guess),
+            scale_by_cost=False,
+        )
+        return result.x, cov
+
+    @staticmethod
+    def _run_curve_fit(
+        fit_type,
+        model_function,
+        t_ns,
+        data_hist_norm,
+        sigma,
+        p0,
+        bounds,
+        circular_params,
+        circular_curve_period=None,
+    ):
+        if fit_type == "curve_fit_circular":
+            return Alignment.curve_fit_circular(
+                model_function,
+                t_ns,
+                data_hist_norm,
+                sigma=sigma,
+                p0=p0,
+                bounds=bounds,
+                circular_params=circular_params,
+                circular_curve_period=circular_curve_period,
+                maxfev=600000,
+            )
+        if fit_type == "curve_fit":
+            return scipy_optimize.curve_fit(
+                model_function,
+                t_ns,
+                data_hist_norm,
+                sigma=sigma,
+                p0=p0,
+                bounds=bounds,
+                maxfev=600000,
+            )
+        raise ValueError(
+            f"Unsupported fit_type: {fit_type}. Supported curve_fit_circular, curve_fit"
+        )
+
+    @staticmethod
+    def _run_weighted_least_squares_fit(
+        fit_model_numpy,
+        t_ns,
+        data_hist,
+        data_hist_norm,
+        data_sum,
+        initial_guess,
+        fit_type,
+        nbin,
+        tau_lower_bound,
+        force_C_normalized,
+    ):
+        sigma = np.sqrt(np.clip(data_hist, 1.0, None)) / data_sum
+        tau_upper_bound = t_ns.max()
+
+        if force_C_normalized:
+            def fit_model_fixed_c(t_ns_fit, dT_bins, tau_ns):
+                return fit_model_numpy(t_ns_fit, 1.0, dT_bins, tau_ns)
+
+            p0 = initial_guess[1:]
+            bounds = Alignment._fixed_c_fit_bounds(nbin, tau_lower_bound, tau_upper_bound)
+            popt_fixed_c, cov_fixed_c = Alignment._run_curve_fit(
+                fit_type,
+                fit_model_fixed_c,
+                t_ns,
+                data_hist_norm,
+                sigma,
+                p0,
+                bounds,
+                circular_params={0: float(nbin)},
+                circular_curve_period=float(nbin),
+            )
+            return Alignment._expand_fixed_c_fit(popt_fixed_c, cov_fixed_c)
+
+        bounds = Alignment._full_fit_bounds(nbin, tau_lower_bound, tau_upper_bound)
+        return Alignment._run_curve_fit(
+            fit_type,
+            fit_model_numpy,
+            t_ns,
+            data_hist_norm,
+            sigma,
+            initial_guess,
+            bounds,
+            circular_params={1: float(nbin)},
+        )
+
+    @staticmethod
+    def _restore_seeded_dT(popt, dT_seed_bins, nbin):
+        if dT_seed_bins is None:
+            return popt
+
+        popt = np.asarray(popt, dtype=float).copy()
+        popt[1] = float(
+            Alignment._wrap_to_period(
+                dT_seed_bins + popt[1],
+                period=float(nbin),
+                center=0.0,
+            )
+        )
+        return popt
+
+    @staticmethod
     def perform_fit_data(
         t,
         data,
@@ -799,7 +1143,7 @@ class Alignment:
         initial_C=None,
         irf_min=1e-5,
         mode="irf_shift",
-        fit_type="circular",
+        fit_type="likelihood",
         force_C_normalized=False,
     ):
         """
@@ -809,7 +1153,12 @@ class Alignment:
         - ``t`` and ``period`` are in nanoseconds.
         - ``tau`` / ``initial_tau`` are in nanoseconds.
         - ``dT`` / ``initial_dT`` are in bins.
-        - ``fit_type`` can be ``"circular"`` or ``"curve_fit"``.
+        - ``fit_type`` can be ``"likelihood"``, ``"curve_fit_circular"``, or
+          ``"curve_fit"``. ``"likelihood"`` uses a Poisson likelihood/deviance
+          fit and is recommended for per-pixel low-count histograms because it
+          avoids the downward lifetime bias of observed-count chi-square
+          weights. The curve-fit modes keep the historical sigma-weighted
+          least-squares behavior.
         - ``force_C_normalized=True`` keeps ``C`` fixed to ``1.0`` and only
           fits ``dT`` and ``tau``.
         - when ``initial_dT is None``, the fitter first pre-shifts the IRF by a
@@ -825,9 +1174,6 @@ class Alignment:
         data_hist = Alignment.to_numpy_1d(data, dtype=float)
         irf_hist = Alignment.to_numpy_1d(irf, dtype=float)
 
-
-
-
         if len(t_ns) != len(data_hist) or len(t_ns) != len(irf_hist):
             raise ValueError("t, data, and irf must have the same 1D length")
 
@@ -835,150 +1181,72 @@ class Alignment:
         irf_sum = irf_hist.sum()
 
         if not np.isfinite(data_sum) or data_sum <= 0:
-            warnings.warn(
-                "data histogram has a non-positive or non-finite sum; skipping fit and returning NaNs",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return {
-                "C": np.nan,
-                "dT": np.nan,
-                "tau": np.nan,
-            }, np.full((3, 3), np.nan, dtype=float)
+            return Alignment._skip_fit_with_warning("data")
         if not np.isfinite(irf_sum) or irf_sum <= 0:
-            warnings.warn(
-                "irf histogram has a non-positive or non-finite sum; skipping fit and returning NaNs",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return {
-                "C": np.nan,
-                "dT": np.nan,
-                "tau": np.nan,
-            }, np.full((3, 3), np.nan, dtype=float)
+            return Alignment._skip_fit_with_warning("irf")
 
-        data_hist_norm = data_hist / data_sum
-        irf_hist_norm = irf_hist / irf_sum
         Alignment._require_scipy_optimize()
+
         nbin = len(t_ns)
-        dT_seed_bins = None
-        fit_irf_hist_norm = irf_hist_norm
-        fit_initial_dT = initial_dT
-
-        if initial_dT is None:
-            dT_seed_bins = Alignment.estimate_peak_dT_bins(data_hist_norm, irf_hist_norm)
-            fit_irf_hist_norm = np.asarray(
-                shift(irf_hist_norm, dT_seed_bins, order=1, mode="grid-wrap"),
-                dtype=float,
-            )
-            fit_irf_hist_norm = fit_irf_hist_norm / fit_irf_hist_norm.sum()
-            fit_initial_dT = 0.0
-
-        fit_lambda = lambda t_ns_fit, C_norm, dT_bins, tau_ns: Alignment.fit_model_data(
-            t_ns_fit,
-            C_norm,
-            dT_bins,
-            tau_ns,
-            irf=fit_irf_hist_norm,
-            period=period,
-            mode=mode,
-        )
-        fit_lambda_numpy = lambda t_ns_fit, C_norm, dT_bins, tau_ns: Alignment.to_numpy_1d(
-            fit_lambda(t_ns_fit, C_norm, dT_bins, tau_ns),
-            dtype=float,
-        )
-
-
-        initial_guess = [1.0, 0.0, 1.0]
-
-        if initial_C is not None:
-            initial_guess[0] = initial_C
-        if fit_initial_dT is not None:
-            initial_guess[1] = fit_initial_dT
-        if initial_tau is not None:
-            initial_guess[2] = initial_tau
-
-        
-        #sigma = np.sqrt(data_hist)
-        sigma = np.sqrt(np.clip(data_hist, 1.0, None)) / data_sum
         tau_lower_bound = float(irf_min)
         if tau_lower_bound <= 0:
             raise ValueError("irf_min must be positive")
-        fit_type = str(fit_type).lower()
 
-        if force_C_normalized:
-            fit_lambda_fixed_c = lambda t_ns_fit, dT_bins, tau_ns: fit_lambda_numpy(
-                t_ns_fit, 1.0, dT_bins, tau_ns
+        fit_type = Alignment._canonical_fit_type(fit_type)
+
+        data_hist_norm = data_hist / data_sum
+        irf_hist_norm = irf_hist / irf_sum
+        fit_irf_hist_norm, fit_initial_dT, dT_seed_bins = Alignment._prepare_fit_irf(
+            data_hist_norm,
+            irf_hist_norm,
+            initial_dT,
+        )
+
+        def fit_model_numpy(t_ns_fit, C_norm, dT_bins, tau_ns):
+            model_hist = Alignment.fit_model_data(
+                t_ns_fit,
+                C_norm,
+                dT_bins,
+                tau_ns,
+                irf=fit_irf_hist_norm,
+                period=period,
+                mode=mode,
             )
-            initial_guess_fixed_c = initial_guess[1:]
-            fit_bounds_fixed_c = ([-nbin / 2, tau_lower_bound], [nbin / 2, t_ns.max()])
+            return Alignment.to_numpy_1d(model_hist, dtype=float)
 
-            if fit_type == "circular":
-                popt_fixed_c, conv_fixed_c = Alignment.curve_fit_circular(
-                    fit_lambda_fixed_c,
-                    t_ns,
-                    data_hist_norm,
-                    sigma=sigma,
-                    p0=initial_guess_fixed_c,
-                    bounds=fit_bounds_fixed_c,
-                    circular_params={0: float(nbin)},
-                    circular_curve_period=float(nbin),
-                    maxfev=600000,
-                )
-            elif fit_type == "curve_fit":
-                popt_fixed_c, conv_fixed_c = scipy_optimize.curve_fit(
-                    fit_lambda_fixed_c,
-                    t_ns,
-                    data_hist_norm,
-                    sigma=sigma,
-                    p0=initial_guess_fixed_c,
-                    bounds=fit_bounds_fixed_c,
-                    maxfev=600000,
-                )
-            else:
-                raise ValueError(f"Unsupported fit_type: {fit_type}. Supported circular, curve_fit")
+        initial_guess = Alignment._fit_initial_guess(
+            initial_C,
+            fit_initial_dT,
+            initial_tau,
+        )
 
-            popt = np.array([1.0, popt_fixed_c[0], popt_fixed_c[1]], dtype=float)
-            conv = np.full((3, 3), np.nan, dtype=float)
-            conv[1:, 1:] = conv_fixed_c
+        if fit_type == "likelihood":
+            popt, cov = Alignment._run_poisson_fit(
+                fit_model_numpy,
+                t_ns,
+                data_hist,
+                data_sum,
+                initial_guess,
+                nbin,
+                tau_lower_bound,
+                force_C_normalized,
+            )
         else:
-            fit_bounds = ([0.0, -nbin / 2, tau_lower_bound], [np.inf, nbin / 2, t_ns.max()])
-
-            if fit_type == "circular":
-                popt, conv = Alignment.curve_fit_circular(
-                    fit_lambda_numpy,
-                    t_ns,
-                    data_hist_norm,
-                    sigma=sigma,
-                    p0=initial_guess,
-                    bounds=fit_bounds,
-                    circular_params={1: float(nbin)},
-                    maxfev=600000,
-                )
-            elif fit_type == "curve_fit":
-                popt, conv = scipy_optimize.curve_fit(
-                    fit_lambda_numpy,
-                    t_ns,
-                    data_hist_norm,
-                    sigma=sigma,
-                    p0=initial_guess,
-                    bounds=fit_bounds,
-                    maxfev=600000,
-                )
-            else:
-                raise ValueError(f"Unsupported fit_type: {fit_type}. Supported circular, curve_fit")
-
-        if dT_seed_bins is not None:
-            popt = np.asarray(popt, dtype=float).copy()
-            popt[1] = float(
-                Alignment._wrap_to_period(
-                    dT_seed_bins + popt[1],
-                    period=float(nbin),
-                    center=0.0,
-                )
+            popt, cov = Alignment._run_weighted_least_squares_fit(
+                fit_model_numpy,
+                t_ns,
+                data_hist,
+                data_hist_norm,
+                data_sum,
+                initial_guess,
+                fit_type,
+                nbin,
+                tau_lower_bound,
+                force_C_normalized,
             )
 
-        return {"C": popt[0], "dT": popt[1], "tau": popt[2]}, conv
+        popt = Alignment._restore_seeded_dT(popt, dT_seed_bins, nbin)
+        return {"C": popt[0], "dT": popt[1], "tau": popt[2]}, cov
 
     @staticmethod
     def phasor_delay_from_hist(hist, period_ns, harmonic=1):

@@ -26,7 +26,7 @@ DEFAULT_REFERENCE_KEY = None
 DEFAULT_TAU_REF = None
 DEFAULT_REFERENCE_TYPE = "ref"
 DEFAULT_FIT_MODE = "model_shift"
-DEFAULT_FIT_TYPE = "circular"
+DEFAULT_FIT_TYPE = "likelihood"
 DEFAULT_C_REF = 1.0
 DEFAULT_IRF_ITERATIONS = 300
 DEFAULT_REGULARIZATION = 0
@@ -64,8 +64,8 @@ class H5DataCalibrator:
         estimated from the reference data when needed by the chosen fit mode.
     fit_mode : str, default ``"model_shift"``
         Fitting mode forwarded to the alignment routines.
-    fit_type : str, default ``"circular"``
-        Fit geometry forwarded to the alignment routines.
+    fit_type : {"likelihood", "curve_fit_circular", "curve_fit"}, default ``"likelihood"``
+        Fitting backend forwarded to the alignment routines.
     C_ref : float, default ``1.0``
         Reference amplitude scaling factor.
     output_path : str or path-like or None, default ``None``
@@ -163,7 +163,7 @@ class H5DataCalibrator:
         self.reference_type = self._normalize_reference_type(reference_type)
         self.tau_ref = tau_ref
         self.fit_mode = fit_mode
-        self.fit_type = fit_type
+        self.fit_type = Alignment._canonical_fit_type(fit_type)
         self.C_ref = C_ref
         self.output_path = Path(output_path) if output_path is not None else self._default_output_path()
         self.overwrite = overwrite
@@ -1291,8 +1291,8 @@ def calibrate_h5_file(
         reference data when needed.
     fit_mode : str, default ``"model_shift"``
         Fitting mode forwarded to the alignment routines.
-    fit_type : str, default ``"circular"``
-        Fit geometry forwarded to the alignment routines.
+    fit_type : {"likelihood", "curve_fit_circular", "curve_fit"}, default ``"likelihood"``
+        Fitting backend forwarded to the alignment routines.
     C_ref : float, default ``1.0``
         Reference amplitude scaling factor.
     irf_iterations : int, default ``300``
